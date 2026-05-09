@@ -1,0 +1,40 @@
+[package]
+name = "cc-switch-market"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+async-stream = "0.3"
+axum = { version = "0.8", features = ["json", "macros", "multipart"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+dialoguer = "0.12"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+fs2 = "0.4"
+futures-util = "0.3"
+hex = "0.4"
+hmac = "0.12"
+http = "1"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+russh = { version = "0.46", default-features = false, features = ["flate2"] }
+rust-embed = { version = "8", features = ["axum"] }
+rust_decimal = { version = "1", features = ["serde", "serde-with-str"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+libsql = "0.9.30"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+mime_guess = "2"
+url = "2"
+
+[dev-dependencies]
+serde_json = "1"

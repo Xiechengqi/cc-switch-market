@@ -1,0 +1,7 @@
+<svg width="32" height="32" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">
+  <circle cx="17" cy="17" r="13" fill="#FBBF24" stroke="#1E293B" stroke-width="2"/>
+  <circle cx="15" cy="15" r="13" fill="#8B5CF6" stroke="#1E293B" stroke-width="2"/>
+  <text x="15" y="21" text-anchor="middle"
+        font-family="Outfit, system-ui, sans-serif" font-weight="800"
+        font-size="17" fill="#FFFFFF">M</text>
+</svg>

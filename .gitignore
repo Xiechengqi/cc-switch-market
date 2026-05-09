@@ -1,0 +1,7 @@
+/target
+/.env
+/web/.next
+/web/node_modules
+/web/.env.local
+/cc-switch-market
+/run.sh

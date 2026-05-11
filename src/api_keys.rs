@@ -112,6 +112,7 @@ pub struct ApiKeyShareAllowlistResponse {
 pub struct AvailableShareItem {
     pub router_id: String,
     pub share_id: String,
+    pub owner_email: Option<String>,
     pub subdomain: Option<String>,
     pub app_type: String,
     pub capabilities: Vec<String>,
@@ -473,6 +474,7 @@ pub async fn available_shares_endpoint(
         .query_all(
             r#"
             SELECT router_id, share_id,
+                   COALESCE(owner_email, installation_owner_email) AS owner_email,
                    COALESCE(NULLIF(subdomain, ''), json_extract(raw_json, '$.subdomain')) AS subdomain,
                    app_type, enabled_codex, enabled_claude, enabled_gemini, online, for_sale, share_status
               FROM router_shares
@@ -498,6 +500,7 @@ pub async fn available_shares_endpoint(
             AvailableShareItem {
                 router_id: row.string("router_id"),
                 share_id: row.string("share_id"),
+                owner_email: row.opt_string("owner_email"),
                 subdomain: row.opt_string("subdomain"),
                 app_type: row.string("app_type"),
                 capabilities,

@@ -1,4 +1,7 @@
+"use client";
+
 import type { ReactNode } from "react";
+import { useLocale } from "@/components/language-provider";
 
 type MoneyAmountProps = {
   gross?: string | number | null;
@@ -14,31 +17,35 @@ function fmt(v: string | number | null | undefined) {
 }
 
 export function MoneyAmount({ gross, fee, net, currency = "USD", layout = "row" }: MoneyAmountProps) {
+  const { locale } = useLocale();
+  const labels = locale === "zh"
+    ? { amount: "金额", fee: "手续费", net: "实际" }
+    : { amount: "Amount", fee: "Fee", net: "Net" };
   const showFee = fee !== undefined && fee !== null;
   const showNet = net !== undefined && net !== null;
   if (layout === "inline") {
     return (
       <span className="font-mono text-sm">
         ${fmt(gross)}
-        {showFee && <span className="text-slate-400"> · 手续费 ${fmt(fee)}</span>}
-        {showNet && <span className="font-bold"> · 实付 ${fmt(net)}</span>}
+        {showFee && <span className="text-slate-400"> · {labels.fee} ${fmt(fee)}</span>}
+        {showNet && <span className="font-bold"> · {labels.net} ${fmt(net)}</span>}
       </span>
     );
   }
   if (layout === "stacked") {
     return (
       <div className="grid gap-1">
-        <Row label="金额" value={fmt(gross)} currency={currency} strong />
-        {showFee && <Row label="手续费" value={fmt(fee)} currency={currency} muted />}
-        {showNet && <Row label="实际" value={fmt(net)} currency={currency} highlight />}
+        <Row label={labels.amount} value={fmt(gross)} currency={currency} strong />
+        {showFee && <Row label={labels.fee} value={fmt(fee)} currency={currency} muted />}
+        {showNet && <Row label={labels.net} value={fmt(net)} currency={currency} highlight />}
       </div>
     );
   }
   return (
     <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
-      <Cell label="金额" value={fmt(gross)} currency={currency} strong />
-      {showFee && <Cell label="手续费" value={fmt(fee)} currency={currency} muted />}
-      {showNet && <Cell label="实际" value={fmt(net)} currency={currency} highlight />}
+      <Cell label={labels.amount} value={fmt(gross)} currency={currency} strong />
+      {showFee && <Cell label={labels.fee} value={fmt(fee)} currency={currency} muted />}
+      {showNet && <Cell label={labels.net} value={fmt(net)} currency={currency} highlight />}
     </div>
   );
 }

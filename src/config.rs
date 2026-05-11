@@ -98,7 +98,7 @@ impl Config {
             market_public_base_url: derived_market_public_base_url,
             rust_log: env(
                 "RUST_LOG",
-                "cc_switch_market=debug,tower_http=info,axum=info",
+                "cc_switch_market=info,tower_http=info,axum=info",
             ),
             market_session_cookie_name: env(
                 "MARKET_SESSION_COOKIE_NAME",
@@ -112,9 +112,9 @@ impl Config {
                 .parse()
                 .unwrap_or(2_592_000),
             market_admin_emails: parse_email_list(&env("MARKET_ADMIN_EMAILS", "admin@example.com")),
-            market_min_request_balance: env("MARKET_MIN_REQUEST_BALANCE", "1.00")
+            market_min_request_balance: env("MARKET_MIN_REQUEST_BALANCE", "0.10")
                 .parse()
-                .unwrap_or(rust_decimal::Decimal::ONE),
+                .unwrap_or_else(|_| rust_decimal::Decimal::new(10, 2)),
             market_platform_commission_bps: env("MARKET_PLATFORM_COMMISSION_BPS", "1000")
                 .parse()
                 .unwrap_or(1000),
@@ -475,13 +475,32 @@ fn env_bool(key: &str, default: bool) -> bool {
 
 fn env_path(key: &str, default_file: &str) -> PathBuf {
     std::env::var_os(key)
-        .map(PathBuf::from)
+        .map(|value| expand_home_path(&PathBuf::from(value)))
         .filter(|value| !value.as_os_str().is_empty())
         .unwrap_or_else(|| {
             config_dir()
                 .unwrap_or_else(|_| PathBuf::from("."))
                 .join(default_file)
         })
+}
+
+fn expand_home_path(path: &Path) -> PathBuf {
+    let Some(raw) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return path.to_path_buf();
+    };
+    if raw == "$HOME" || raw == "~" {
+        return home;
+    }
+    if let Some(rest) = raw.strip_prefix("$HOME/") {
+        return home.join(rest);
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return home.join(rest);
+    }
+    path.to_path_buf()
 }
 
 fn parse_email_list(value: &str) -> Vec<String> {

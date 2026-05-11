@@ -30,6 +30,7 @@ pub struct PriceItem {
     pub official_output_per_million: Option<Decimal>,
     pub official_cache_read_per_million: Option<Decimal>,
     pub official_cache_write_per_million: Option<Decimal>,
+    pub discount_percent: Decimal,
     pub currency: String,
     pub status: String,
 }
@@ -107,6 +108,17 @@ pub struct ModelPriceInput {
     pub cache_read_per_million: Option<Decimal>,
     pub cache_write_per_million: Option<Decimal>,
     pub reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct VendorDiscountInput {
+    pub discount_percent: Decimal,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct VendorDiscountItem {
+    pub app_type: String,
+    pub discount_percent: Decimal,
 }
 
 #[derive(Deserialize)]
@@ -220,7 +232,15 @@ pub async fn upsert_price(
     .await?;
     let row = db
         .query_one(
-            "SELECT mp.id, mp.model_id, mp.app_type, mp.model_pattern, m.display_name, m.is_public, mp.input_per_million, mp.output_per_million, mp.cache_read_per_million, mp.cache_write_per_million, mp.currency, mp.status FROM model_prices mp LEFT JOIN models m ON m.id = mp.model_id WHERE mp.id = ?1",
+            r#"
+            SELECT mp.id, mp.model_id, mp.app_type, mp.model_pattern, m.display_name, m.is_public,
+                   mp.input_per_million, mp.output_per_million, mp.cache_read_per_million,
+                   mp.cache_write_per_million, mp.currency, mp.status, COALESCE(vd.discount_percent, '10') AS discount_percent
+              FROM model_prices mp
+              LEFT JOIN models m ON m.id = mp.model_id
+              LEFT JOIN model_vendor_discounts vd ON vd.app_type = mp.app_type
+             WHERE mp.id = ?1
+            "#,
             vec![crate::db::uuid_val(id)],
         )
         .await?;
@@ -264,6 +284,55 @@ pub async fn admin_list_models(
     Ok(Json(fetch_models(state.db()).await?))
 }
 
+pub async fn admin_put_model_vendor_discount(
+    State(state): State<AppState>,
+    AdminPrincipal(admin): AdminPrincipal,
+    Path(app_type): Path<String>,
+    Json(input): Json<VendorDiscountInput>,
+) -> Result<Json<VendorDiscountItem>, ApiError> {
+    validate_app_type(&app_type)?;
+    if input.discount_percent <= Decimal::ZERO || input.discount_percent > Decimal::from(100u32) {
+        return Err(ApiError::bad_request(
+            "invalid_discount_percent",
+            "discount percent must be greater than 0 and no more than 100",
+        ));
+    }
+    let now = crate::db::now_string();
+    state
+        .db()
+        .execute(
+            r#"
+            INSERT INTO model_vendor_discounts (app_type, discount_percent, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(app_type) DO UPDATE SET
+              discount_percent=excluded.discount_percent,
+              updated_at=excluded.updated_at
+            "#,
+            vec![
+                crate::db::val(&app_type),
+                crate::db::dec_val(input.discount_percent),
+                crate::db::val(&now),
+            ],
+        )
+        .await?;
+    write_admin_audit(
+        &state,
+        &admin.email,
+        "model_vendor_discount.update",
+        "model_vendor_discount",
+        Uuid::new_v4(),
+        serde_json::json!({
+            "app_type": app_type,
+            "discount_percent": input.discount_percent.to_string(),
+        }),
+    )
+    .await?;
+    Ok(Json(VendorDiscountItem {
+        app_type,
+        discount_percent: input.discount_percent,
+    }))
+}
+
 pub async fn admin_get_model(
     State(state): State<AppState>,
     _admin: AdminPrincipal,
@@ -282,6 +351,7 @@ pub async fn admin_create_model(
     let status = input.status.unwrap_or_else(|| "active".to_string());
     validate_app_type(&input.app_type)?;
     validate_status(&status)?;
+    ensure_vendor_discount(state.db(), &input.app_type).await?;
     state.db().execute(
         r#"
         INSERT INTO models
@@ -710,9 +780,10 @@ pub fn cost_with_cache(
 async fn fetch_prices(db: &crate::db::Db, public_only: bool) -> Result<Vec<PriceItem>, ApiError> {
     let mut sql = r#"
         SELECT mp.id, mp.model_id, mp.app_type, mp.model_pattern, m.display_name, m.is_public, mp.input_per_million, mp.output_per_million, mp.cache_read_per_million,
-               mp.cache_write_per_million, mp.currency, COALESCE(m.status, mp.status) AS status
+               mp.cache_write_per_million, mp.currency, COALESCE(m.status, mp.status) AS status, COALESCE(vd.discount_percent, '10') AS discount_percent
           FROM model_prices mp
           LEFT JOIN models m ON m.id = mp.model_id
+          LEFT JOIN model_vendor_discounts vd ON vd.app_type = mp.app_type
          WHERE 1=1
         "#.to_string();
     if public_only {
@@ -726,38 +797,47 @@ async fn fetch_prices(db: &crate::db::Db, public_only: bool) -> Result<Vec<Price
 fn row_to_price(row: crate::db::DbRow) -> PriceItem {
     let app_type = row.string("app_type");
     let model_pattern = row.string("model_pattern");
-    let official = official_reference_price(&app_type, &model_pattern);
+    let discount_percent = row.opt_decimal("discount_percent").unwrap_or(Decimal::TEN);
+    let discount_multiplier = discount_percent / Decimal::from(100u32);
+    let official_input_per_million = row.decimal("input_per_million");
+    let official_output_per_million = row.decimal("output_per_million");
+    let official_cache_read_per_million = row.decimal("cache_read_per_million");
+    let official_cache_write_per_million = row.decimal("cache_write_per_million");
+    let cache_read_missing = official_price_field_missing(&app_type, &model_pattern, "cache_read");
+    let cache_write_missing =
+        official_price_field_missing(&app_type, &model_pattern, "cache_write");
     PriceItem {
         id: row.uuid("id"),
         model_id: row.opt_uuid("model_id"),
         display_name: row.opt_string("display_name"),
         is_public: row.opt_string("is_public").map(|_| row.bool("is_public")),
-        cache_read_per_million: if official_price_field_missing(
-            &app_type,
-            &model_pattern,
-            "cache_read",
-        ) {
+        cache_read_per_million: if cache_read_missing {
             None
         } else {
-            Some(row.decimal("cache_read_per_million"))
+            Some(official_cache_read_per_million * discount_multiplier)
         },
-        cache_write_per_million: if official_price_field_missing(
-            &app_type,
-            &model_pattern,
-            "cache_write",
-        ) {
+        cache_write_per_million: if cache_write_missing {
             None
         } else {
-            Some(row.decimal("cache_write_per_million"))
+            Some(official_cache_write_per_million * discount_multiplier)
         },
         app_type,
         model_pattern,
-        input_per_million: row.decimal("input_per_million"),
-        output_per_million: row.decimal("output_per_million"),
-        official_input_per_million: official.as_ref().map(|p| p.input_per_million),
-        official_output_per_million: official.as_ref().map(|p| p.output_per_million),
-        official_cache_read_per_million: official.as_ref().and_then(|p| p.cache_read_per_million),
-        official_cache_write_per_million: official.as_ref().and_then(|p| p.cache_write_per_million),
+        input_per_million: official_input_per_million * discount_multiplier,
+        output_per_million: official_output_per_million * discount_multiplier,
+        official_input_per_million: Some(official_input_per_million),
+        official_output_per_million: Some(official_output_per_million),
+        official_cache_read_per_million: if cache_read_missing {
+            None
+        } else {
+            Some(official_cache_read_per_million)
+        },
+        official_cache_write_per_million: if cache_write_missing {
+            None
+        } else {
+            Some(official_cache_write_per_million)
+        },
+        discount_percent,
         currency: row.string("currency"),
         status: row.string("status"),
     }
@@ -811,8 +891,9 @@ async fn model_item_from_row(
             r#"
         SELECT mp.id, mp.model_id, mp.app_type, mp.model_pattern, m.display_name, m.is_public,
                mp.input_per_million, mp.output_per_million, mp.cache_read_per_million,
-               mp.cache_write_per_million, mp.currency, mp.status
+               mp.cache_write_per_million, mp.currency, mp.status, COALESCE(vd.discount_percent, '10') AS discount_percent
           FROM model_prices mp LEFT JOIN models m ON m.id=mp.model_id
+          LEFT JOIN model_vendor_discounts vd ON vd.app_type = mp.app_type
          WHERE mp.model_id=?1 AND mp.status='active'
          ORDER BY mp.effective_from DESC LIMIT 1
         "#,
@@ -895,6 +976,7 @@ async fn ensure_model(
     display_name: Option<String>,
 ) -> Result<Uuid, ApiError> {
     validate_app_type(app_type)?;
+    ensure_vendor_discount(db, app_type).await?;
     let now = crate::db::now_string();
     if let Some(row) = db.query_optional(
         "SELECT id FROM models WHERE app_type=?1 AND COALESCE(model_pattern, canonical_name)=?2 LIMIT 1",
@@ -918,6 +1000,20 @@ async fn ensure_model(
         ],
     ).await?;
     Ok(id)
+}
+
+async fn ensure_vendor_discount(db: &crate::db::Db, app_type: &str) -> Result<(), ApiError> {
+    let now = crate::db::now_string();
+    db.execute(
+        r#"
+        INSERT INTO model_vendor_discounts (app_type, discount_percent, updated_at)
+        VALUES (?1, '10', ?2)
+        ON CONFLICT(app_type) DO NOTHING
+        "#,
+        vec![crate::db::val(app_type), crate::db::val(now)],
+    )
+    .await?;
+    Ok(())
 }
 
 async fn upsert_model_price_inner(
@@ -1377,60 +1473,7 @@ async fn write_admin_audit(
 
 fn official_price_field_missing(app_type: &str, _model_pattern: &str, field: &str) -> bool {
     // OpenAI publishes discounted cached input pricing, but no separate cache-write price.
-    app_type == "openai" && field == "cache_write"
-}
-
-#[derive(Clone, Copy)]
-struct OfficialReferencePrice {
-    input_per_million: Decimal,
-    output_per_million: Decimal,
-    cache_read_per_million: Option<Decimal>,
-    cache_write_per_million: Option<Decimal>,
-}
-
-fn official_reference_price(app_type: &str, model_pattern: &str) -> Option<OfficialReferencePrice> {
-    let market = crate::db::default_model_prices()
-        .iter()
-        .filter(|price| {
-            price.app_type == app_type
-                && (price.model_pattern == "*"
-                    || price.model_pattern == model_pattern
-                    || price.model_pattern.ends_with('*')
-                        && model_pattern.starts_with(price.model_pattern.trim_end_matches('*')))
-        })
-        .max_by_key(|price| {
-            if price.model_pattern == "*" {
-                0
-            } else {
-                price.model_pattern.len()
-            }
-        })?;
-    Some(OfficialReferencePrice {
-        input_per_million: scale_reference_price(market.input),
-        output_per_million: scale_reference_price(market.output),
-        cache_read_per_million: if official_price_field_missing(
-            app_type,
-            model_pattern,
-            "cache_read",
-        ) {
-            None
-        } else {
-            Some(scale_reference_price(market.cache_read))
-        },
-        cache_write_per_million: if official_price_field_missing(
-            app_type,
-            model_pattern,
-            "cache_write",
-        ) {
-            None
-        } else {
-            Some(scale_reference_price(market.cache_write))
-        },
-    })
-}
-
-fn scale_reference_price(value: &str) -> Decimal {
-    value.parse::<Decimal>().unwrap_or(Decimal::ZERO) * Decimal::TEN
+    matches!(app_type, "openai" | "deepseek") && field == "cache_write"
 }
 
 fn price_change_json(row: crate::db::DbRow) -> serde_json::Value {

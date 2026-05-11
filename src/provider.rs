@@ -14,6 +14,9 @@ use crate::{
     router_notifications,
 };
 
+const GATEIO_MIN_PAYOUT_USD: u64 = 1;
+const MANUAL_MIN_PAYOUT_USD: u64 = 20;
+
 #[derive(Serialize)]
 pub struct ClaimSummary {
     pub owner_email: String,
@@ -115,8 +118,8 @@ pub async fn claim_summary(
         available_usd: available,
         pending_usd: pending,
         paid_usd: paid,
-        minimum_payout_usd: Decimal::ONE,
-        can_payout: available >= Decimal::ONE,
+        minimum_payout_usd: Decimal::from(GATEIO_MIN_PAYOUT_USD),
+        can_payout: available >= Decimal::from(GATEIO_MIN_PAYOUT_USD),
     }))
 }
 
@@ -224,13 +227,16 @@ pub async fn payout_preview(
         },
     )
     .await?;
+    let can_payout = validate_payout_amount(&query.method, query.amount_usd).is_ok()
+        && net > Decimal::ZERO
+        && available >= query.amount_usd;
     Ok(Json(serde_json::json!({
         "method": query.method,
         "gross_amount_usd": query.amount_usd.to_string(),
         "payout_fee_usd": fee.to_string(),
         "net_payout_usd": net.to_string(),
         "available_usd": available.to_string(),
-        "can_payout": query.amount_usd >= Decimal::ONE && net > Decimal::ZERO && available >= query.amount_usd,
+        "can_payout": can_payout,
         "fee_policy_snapshot": fee_policy_snapshot,
     })))
 }
@@ -241,31 +247,26 @@ pub async fn create_gateio_payout(
     Json(input): Json<GateioPayoutRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     crate::rate_limit::check("provider_payout_create", &principal.email, 6)?;
-    let has_email = input
-        .params
-        .get("email")
-        .and_then(|value| value.as_str())
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
-    let has_uid = input
+    let uid = input
         .params
         .get("uid")
         .and_then(|value| value.as_str())
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
-    if !has_email && !has_uid {
+        .map(str::trim)
+        .filter(|value| value.parse::<u64>().is_ok());
+    let Some(uid) = uid else {
         return Err(ApiError::bad_request(
-            "missing_gateio_target",
-            "Gate.io email or uid is required",
+            "missing_gateio_uid",
+            "Gate.io user UID is required",
         ));
-    }
+    };
+    let params = serde_json::json!({ "uid": uid });
     state
         .db()
         .execute(
             "INSERT INTO provider_claim_profiles (owner_email, method, params_json, updated_at) VALUES (?1,'gateio',?2,?3) ON CONFLICT(owner_email) DO UPDATE SET method='gateio', params_json=excluded.params_json, updated_at=excluded.updated_at",
             vec![
                 crate::db::val(&principal.email),
-                crate::db::json_val(input.params.clone()),
+                crate::db::json_val(params.clone()),
                 crate::db::val(crate::db::now_string()),
             ],
         )
@@ -274,7 +275,7 @@ pub async fn create_gateio_payout(
         &state,
         &principal.email,
         "gateio",
-        input.params,
+        params,
         input.amount_usd,
         input._fee_usd,
         input._net_payout_usd,
@@ -795,7 +796,8 @@ pub async fn insert_payout_locked(
     fee_policy_snapshot: serde_json::Value,
     ticket_id: Option<Uuid>,
 ) -> Result<Uuid, ApiError> {
-    if amount < Decimal::ONE || amount <= fee || net != amount - fee {
+    validate_payout_amount(method, amount)?;
+    if amount <= fee || net != amount - fee {
         return Err(ApiError::bad_request(
             "invalid_payout_amount",
             "invalid payout amount",
@@ -871,6 +873,16 @@ async fn payout_fee(
     method: &str,
     amount: Decimal,
 ) -> Result<(Decimal, serde_json::Value), ApiError> {
+    if matches!(method, "gateio" | "manual") {
+        return Ok((
+            Decimal::ZERO,
+            serde_json::json!({
+                "method": method,
+                "source": "no_fee",
+                "computedFeeUsd": "0",
+            }),
+        ));
+    }
     let row = db
         .query_optional(
             "SELECT id, fixed_usd, percent_bps, min_usd, max_usd, effective_from FROM fee_policies WHERE fee_type = 'payout' AND method = ?1 AND status = 'active' ORDER BY effective_from DESC LIMIT 1",
@@ -907,6 +919,21 @@ async fn payout_fee(
             "computedFeeUsd": fee.to_string(),
         }),
     ))
+}
+
+fn validate_payout_amount(method: &str, amount: Decimal) -> Result<(), ApiError> {
+    let min_amount = match method {
+        "manual" => Decimal::from(MANUAL_MIN_PAYOUT_USD),
+        "gateio" => Decimal::from(GATEIO_MIN_PAYOUT_USD),
+        _ => Decimal::from(GATEIO_MIN_PAYOUT_USD),
+    };
+    if amount < min_amount || amount != amount.trunc() {
+        return Err(ApiError::bad_request(
+            "invalid_payout_amount",
+            "payout amount must be an integer USD amount and meet the method minimum",
+        ));
+    }
+    Ok(())
 }
 
 async fn paid_total(db: &crate::db::Db, owner_email: &str) -> Result<Decimal, ApiError> {

@@ -59,7 +59,6 @@ export function MemphisPieChart({
               content={(props: object) => (
                 <MemphisTooltip
                   {...(props as Record<string, unknown>)}
-                  formatSeriesLabel={(key) => key}
                   formatValue={formatValue}
                 />
               )}

@@ -27,6 +27,7 @@ mod support;
 mod topups;
 mod types;
 mod usage;
+mod version;
 
 use std::net::SocketAddr;
 
@@ -110,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "cc_switch_market=debug,tower_http=info,axum=info".into()),
+                .unwrap_or_else(|_| "cc_switch_market=info,tower_http=info,axum=info".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -294,6 +295,10 @@ fn build_router(state: AppState) -> Router {
             post(pricing::admin_route_preview),
         )
         .route(
+            "/v1/admin/model-vendor-discounts/{app_type}",
+            put(pricing::admin_put_model_vendor_discount),
+        )
+        .route(
             "/v1/admin/models/{id}",
             get(pricing::admin_get_model)
                 .patch(pricing::admin_patch_model)
@@ -460,6 +465,9 @@ fn build_router(state: AppState) -> Router {
             "/v1/admin/settings/footer-links",
             put(admin::update_footer_links),
         )
+        .route("/v1/admin/version", get(version::admin_version))
+        .route("/v1/admin/version/restart", post(version::admin_restart))
+        .route("/v1/admin/version/update", post(version::admin_update))
         .route("/v1/admin/audit", get(admin::audit))
         .fallback(static_assets::serve)
         .with_state(state)

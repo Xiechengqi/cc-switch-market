@@ -316,7 +316,24 @@ pub async fn top_models(
     let rows = state
         .db()
         .query_all(
-            "SELECT app_type, model, COALESCE(SUM(CAST(usage_amount AS REAL)), 0) AS total, COUNT(*) AS calls, COUNT(DISTINCT user_id) AS users FROM request_charges WHERE status='settled' AND created_at >= ?1 GROUP BY app_type, model ORDER BY total DESC LIMIT ?2",
+            r#"
+            SELECT app_type,
+                   model,
+                   COALESCE(SUM(CAST(usage_amount AS REAL)), 0) AS total,
+                   COALESCE(SUM(
+                     CAST(COALESCE(json_extract(usage_json, '$.input_tokens'), 0) AS INTEGER) +
+                     CAST(COALESCE(json_extract(usage_json, '$.output_tokens'), 0) AS INTEGER) +
+                     CAST(COALESCE(json_extract(usage_json, '$.cache_read_tokens'), 0) AS INTEGER) +
+                     CAST(COALESCE(json_extract(usage_json, '$.cache_write_tokens'), 0) AS INTEGER)
+                   ), 0) AS total_tokens,
+                   COUNT(*) AS calls,
+                   COUNT(DISTINCT user_id) AS users
+              FROM request_charges
+             WHERE status='settled' AND created_at >= ?1
+             GROUP BY app_type, model
+             ORDER BY total DESC
+             LIMIT ?2
+            "#,
             vec![crate::db::val(cutoff), crate::db::val(limit.to_string())],
         )
         .await?;
@@ -327,6 +344,7 @@ pub async fn top_models(
                 "appType": row.string("app_type"),
                 "model": row.string("model"),
                 "spendUsd": money_string(row.string("total")),
+                "totalUsage": row.i64("total_tokens"),
                 "requests": row.i64("calls"),
                 "uniqueUsers": row.i64("users"),
             })

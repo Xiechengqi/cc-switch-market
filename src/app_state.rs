@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use anyhow::Context;
@@ -15,6 +16,7 @@ pub struct AppState {
     pub object_store: ObjectStore,
     pub http: Client,
     pub metrics: AppMetrics,
+    pub started_at: Instant,
 }
 
 #[derive(Clone, Default)]
@@ -130,6 +132,7 @@ impl AppState {
             object_store,
             http: Client::new(),
             metrics: AppMetrics::default(),
+            started_at: Instant::now(),
         };
         if state.config.gateio_auto_payout_enabled {
             match crate::gateio::self_check(&state).await {

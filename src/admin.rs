@@ -1738,8 +1738,8 @@ fn env_fields() -> Vec<EnvField> {
             kind: "text",
             secret: false,
             required: true,
-            default_value: "cc_switch_market=debug,tower_http=info,axum=info",
-            placeholder: "cc_switch_market=debug,tower_http=info,axum=info",
+            default_value: "cc_switch_market=info,tower_http=info,axum=info",
+            placeholder: "cc_switch_market=info,tower_http=info,axum=info",
             unit: "",
         },
         EnvField {
@@ -1850,8 +1850,8 @@ fn env_fields() -> Vec<EnvField> {
             kind: "number",
             secret: false,
             required: true,
-            default_value: "1.00",
-            placeholder: "1.00",
+            default_value: "0.10",
+            placeholder: "0.10",
             unit: "USD",
         },
         EnvField {
@@ -1920,8 +1920,8 @@ fn env_fields() -> Vec<EnvField> {
             kind: "path",
             secret: false,
             required: true,
-            default_value: "cc-switch-market.db",
-            placeholder: "cc-switch-market.db",
+            default_value: "$HOME/.config/cc-switch-market/cc-switch-market.db",
+            placeholder: "$HOME/.config/cc-switch-market/cc-switch-market.db",
             unit: "",
         },
         EnvField {
@@ -1962,8 +1962,8 @@ fn env_fields() -> Vec<EnvField> {
             kind: "path",
             secret: false,
             required: true,
-            default_value: "turso-replica.db",
-            placeholder: "turso-replica.db",
+            default_value: "$HOME/.config/cc-switch-market/turso-replica.db",
+            placeholder: "$HOME/.config/cc-switch-market/turso-replica.db",
             unit: "",
         },
         EnvField {
@@ -2046,8 +2046,8 @@ fn env_fields() -> Vec<EnvField> {
             kind: "path",
             secret: false,
             required: true,
-            default_value: "objects",
-            placeholder: "objects",
+            default_value: "$HOME/.config/cc-switch-market/objects",
+            placeholder: "$HOME/.config/cc-switch-market/objects",
             unit: "",
         },
         EnvField {
@@ -2122,7 +2122,7 @@ fn env_fields() -> Vec<EnvField> {
         },
         EnvField {
             key: "ROUTER_BASE_DOMAIN",
-            category: "router",
+            category: "runtime",
             label_zh: "Router 基础域名",
             label_en: "Router base domain",
             description_zh: "cc-switch-router 的域名，仅域名不含协议或路径。生产环境务必替换 localhost。",
@@ -2136,7 +2136,7 @@ fn env_fields() -> Vec<EnvField> {
         },
         EnvField {
             key: "ROUTER_MARKET_SUBDOMAIN",
-            category: "router",
+            category: "runtime",
             label_zh: "Market 子域",
             label_en: "Market subdomain",
             description_zh: "在 ROUTER_BASE_DOMAIN 上为本 market 暴露的子域名。",
@@ -2150,7 +2150,7 @@ fn env_fields() -> Vec<EnvField> {
         },
         EnvField {
             key: "MARKET_DISPLAY_NAME",
-            category: "router",
+            category: "runtime",
             label_zh: "Market 显示名",
             label_en: "Market display name",
             description_zh: "向 router 注册时使用的人类可读名称。",
@@ -2381,7 +2381,6 @@ fn env_settings_payload() -> Result<serde_json::Value, ApiError> {
             {"key": "routing"},
             {"key": "database"},
             {"key": "storage"},
-            {"key": "router"},
             {"key": "payments"}
         ],
     }))

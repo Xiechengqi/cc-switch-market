@@ -33,8 +33,8 @@ export function AnnouncementModal({
   onReadAll?: (seenIds: string[]) => void;
 }) {
   const { locale, t } = useLocale();
-  const [items, setItems] = useState<SiteAnnouncement[]>(readAnnouncements);
-  const [seen, setSeen] = useState<string[]>(readSeenAnnouncementIds);
+  const [items, setItems] = useState<SiteAnnouncement[]>([]);
+  const [seen, setSeen] = useState<string[]>([]);
   const formatDate = useDateTimeFormatter();
 
   useEffect(() => {
@@ -42,6 +42,7 @@ export function AnnouncementModal({
       setItems(readAnnouncements());
       setSeen(readSeenAnnouncementIds());
     }
+    refresh();
     window.addEventListener("cc-switch-market:announcements-updated", refresh as EventListener);
     window.addEventListener("cc-switch-market:announcements-seen-updated", refresh as EventListener);
     window.addEventListener("storage", refresh);
@@ -66,7 +67,7 @@ export function AnnouncementModal({
       open={open}
       onClose={onClose}
       title={t.nav.announcements}
-      description={locale === "zh" ? "最近更新、价格提醒与维护通知。" : "Updates, pricing notes, and maintenance windows."}
+      description={locale === "zh" ? "最近更新、价格提醒与维护通知" : "Updates, pricing notes, and maintenance windows."}
       width="lg"
     >
       <div className="grid gap-4">

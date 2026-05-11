@@ -20,7 +20,7 @@ export const defaultAnnouncements: SiteAnnouncement[] = [
       en: "Email code login is live"
     },
     body: {
-      zh: "cc-switch Market 现已统一使用 router 邮箱验证码登录。Provider 请使用 share owner email 登录后领取收益。",
+      zh: "cc-switch Market 现已统一使用 router 邮箱验证码登录。Provider 请使用 share owner email 登录后领取收益",
       en: "cc-switch Market now uses router email code login. Providers should sign in with the share owner email to claim earnings."
     },
     publishedAt: "2026-04-29T10:00:00Z",
@@ -35,7 +35,7 @@ export const defaultAnnouncements: SiteAnnouncement[] = [
       en: "Pricing moved to the homepage"
     },
     body: {
-      zh: "统一 token 价格、平台抽成说明与接入示例，现已集中展示在首页，减少路由跳转。",
+      zh: "统一 token 价格、平台抽成说明与接入示例，现已集中展示在首页，减少路由跳转",
       en: "Unified token pricing, the platform take explanation, and quick-start examples are now grouped on the homepage."
     },
     publishedAt: "2026-04-29T12:00:00Z",
@@ -50,7 +50,7 @@ export const defaultAnnouncements: SiteAnnouncement[] = [
       en: "Failed payouts enter review"
     },
     body: {
-      zh: "Gate.io 网络异常或结果未知时，提现请求会进入“待复核”，避免重复打款。",
+      zh: "Gate.io 网络异常或结果未知时，提现请求会进入“待复核”，避免重复打款",
       en: "When Gate.io times out or returns an uncertain result, payout requests move to review to avoid duplicate transfers."
     },
     publishedAt: "2026-04-29T14:00:00Z",

@@ -86,7 +86,7 @@ export function DataTable<T>({ columns, rows, rowKey, loading, empty, expandable
   }
 
   if (!rows.length) {
-    return empty ?? <EmptyState shape="circle" title="这里还空着" hint="数据出现后会展示在这里。" />;
+    return empty ?? <EmptyState shape="circle" title="这里还空着" hint="数据出现后会展示在这里" />;
   }
 
   return (

@@ -147,6 +147,14 @@ export function ClaimRoot() {
             <div className="flex items-center gap-3">
               <span className="rounded-full border-2 border-slate-800 bg-emerald-400 p-2 text-white"><Banknote size={18} /></span>
               <h3 className="font-display text-xl font-extrabold">{c.gateioTitle}</h3>
+              <a
+                href="https://www.gate.com/zh/referral/earn-together/invite/X1AVBFpX?ref=X1AVBFpX&ref_type=103&utm_cmp=rXJBDjtJ&activity_id=1776947564884"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-xs font-bold text-violet-600 underline decoration-2 underline-offset-2"
+              >
+                {c.gateioRegister}
+              </a>
             </div>
             <p className="mt-2 text-sm text-slate-600">{c.gateioBody}</p>
             <button onClick={() => setOpenGateio(true)} className="mt-4 inline-flex items-center gap-2 rounded-full border-2 border-slate-800 bg-violet-500 px-5 py-2 font-bold text-white btn-pop">
@@ -243,27 +251,28 @@ function GateioPayoutModal({ open, onClose, max }: { open: boolean; onClose: () 
   const toast = useToast();
   const { locale } = useLocale();
   const c = copy[locale].claim;
-  const [tab, setTab] = useState<"email" | "uid">("email");
   const [amount, setAmount] = useState(max);
-  const [email, setEmail] = useState("");
   const [uid, setUid] = useState("");
   const [preview, setPreview] = useState<Preview | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
-  useEffect(() => { if (open) setAmount(max); }, [open, max]);
+  useEffect(() => { if (open) { setAmount(integerPayoutMax(max)); setUid(""); } }, [open, max]);
 
   useEffect(() => {
-    if (!open || !amount) { setPreview(null); return; }
+    if (!open || !isValidIntegerPayoutAmount(amount, max, 1)) { setPreview(null); return; }
     apiGet<Preview>(`/v1/provider/claim/payout-preview?method=gateio&amount_usd=${encodeURIComponent(amount)}`).then(setPreview).catch(() => setPreview(null));
-  }, [amount, open]);
+  }, [amount, max, open]);
 
   async function submit() {
-    if (tab === "email" && !email.includes("@")) { toast.push({ variant: "error", title: c.submitInvalidEmail }); return; }
-    if (tab === "uid" && !uid) { toast.push({ variant: "error", title: c.submitInvalidUid }); return; }
+    if (!isValidIntegerPayoutAmount(amount, max, 1)) {
+      toast.push({ variant: "error", title: c.payoutInvalidAmount, description: c.gateioAmountHint });
+      return;
+    }
+    if (!isGateioUid(uid)) { toast.push({ variant: "error", title: c.submitInvalidUid }); return; }
     setSubmitting(true);
     try {
       await apiPost("/v1/provider/claim/payout", {
-        params: tab === "email" ? { email } : { uid },
+        params: { uid: uid.trim() },
         amount_usd: amount
       });
       toast.push({ variant: "success", title: c.submitSuccess, description: c.submitSuccessDesc });
@@ -280,19 +289,15 @@ function GateioPayoutModal({ open, onClose, max }: { open: boolean; onClose: () 
       <div className="grid gap-4">
         <label className="grid gap-2">
           <span className="text-xs font-bold uppercase tracking-wider text-slate-600">{c.gateioAmountLabel}</span>
-          <input type="number" min="1" step="0.01" value={amount} onChange={(e) => setAmount(e.target.value)} className="rounded-2xl border-2 border-slate-800 bg-amber-50 px-4 py-3 text-xl font-bold outline-none focus:bg-white" />
-          <span className="text-xs text-slate-500">{c.gateioMaxHint(max)}</span>
+          <input type="number" min="1" step="1" value={amount} onChange={(e) => setAmount(e.target.value)} className="rounded-2xl border-2 border-slate-800 bg-amber-50 px-4 py-3 text-xl font-bold outline-none focus:bg-white" />
+          <span className="text-xs text-slate-500">{c.gateioMaxHint(integerPayoutMax(max))} · {c.gateioAmountHint}</span>
         </label>
         <PreviewBox value={preview} />
-        <div className="flex gap-2">
-          <button onClick={() => setTab("email")} className={`rounded-full border-2 border-slate-800 px-3 py-1 text-sm font-bold ${tab === "email" ? "bg-violet-500 text-white" : "bg-white"}`}>{c.gateioByEmail}</button>
-          <button onClick={() => setTab("uid")} className={`rounded-full border-2 border-slate-800 px-3 py-1 text-sm font-bold ${tab === "uid" ? "bg-violet-500 text-white" : "bg-white"}`}>{c.gateioByUid}</button>
-        </div>
-        {tab === "email" ? (
-          <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder={c.gateioEmailPlaceholder} className="rounded-2xl border-2 border-slate-800 bg-amber-50 px-4 py-3 outline-none focus:bg-white" />
-        ) : (
+        <label className="grid gap-2">
+          <span className="text-xs font-bold uppercase tracking-wider text-slate-600">{c.gateioUidLabel}</span>
           <input value={uid} onChange={(e) => setUid(e.target.value)} placeholder={c.gateioUidPlaceholder} inputMode="numeric" className="rounded-2xl border-2 border-slate-800 bg-amber-50 px-4 py-3 outline-none focus:bg-white" />
-        )}
+          <span className="text-xs text-slate-500">{c.gateioUidHint}</span>
+        </label>
       </div>
       <ModalActions>
         <button onClick={onClose} className="mt-5 rounded-full border-2 border-slate-800 bg-white px-5 py-2 font-bold lift">{c.submitCancel}</button>
@@ -314,13 +319,17 @@ function ManualPayoutModal({ open, onClose, max }: { open: boolean; onClose: () 
   const [preview, setPreview] = useState<Preview | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
-  useEffect(() => { if (open) { setAmount(max); setText(""); setFiles([]); } }, [open, max]);
+  useEffect(() => { if (open) { setAmount(integerPayoutMax(max)); setText(""); setFiles([]); } }, [open, max]);
   useEffect(() => {
-    if (!open || !amount) { setPreview(null); return; }
+    if (!open || !isValidIntegerPayoutAmount(amount, max, 20)) { setPreview(null); return; }
     apiGet<Preview>(`/v1/provider/claim/payout-preview?method=manual&amount_usd=${encodeURIComponent(amount)}`).then(setPreview).catch(() => setPreview(null));
-  }, [amount, open]);
+  }, [amount, max, open]);
 
   async function submit() {
+    if (!isValidIntegerPayoutAmount(amount, max, 20)) {
+      toast.push({ variant: "error", title: c.payoutInvalidAmount, description: c.manualAmountHint });
+      return;
+    }
     if (!text.trim()) { toast.push({ variant: "error", title: c.manualMissingDetails }); return; }
     setSubmitting(true);
     try {
@@ -351,7 +360,8 @@ function ManualPayoutModal({ open, onClose, max }: { open: boolean; onClose: () 
       <div className="grid gap-4">
         <label className="grid gap-2">
           <span className="text-xs font-bold uppercase tracking-wider text-slate-600">{c.manualAmountLabel}</span>
-          <input type="number" min="1" step="0.01" value={amount} onChange={(e) => setAmount(e.target.value)} className="rounded-2xl border-2 border-slate-800 bg-amber-50 px-4 py-3 text-xl font-bold outline-none focus:bg-white" />
+          <input type="number" min="20" step="1" value={amount} onChange={(e) => setAmount(e.target.value)} className="rounded-2xl border-2 border-slate-800 bg-amber-50 px-4 py-3 text-xl font-bold outline-none focus:bg-white" />
+          <span className="text-xs text-slate-500">{c.gateioMaxHint(integerPayoutMax(max))} · {c.manualAmountHint}</span>
         </label>
         <PreviewBox value={preview} />
         <label className="grid gap-2">
@@ -588,6 +598,21 @@ function isValidTransferAmount(amount: string, max: string) {
   const value = Number(amount);
   const maxValue = Number(max);
   return Number.isFinite(value) && Number.isFinite(maxValue) && value > 0 && value <= maxValue;
+}
+
+function integerPayoutMax(max: string) {
+  const maxValue = Math.floor(Number(max));
+  return Number.isFinite(maxValue) && maxValue > 0 ? String(maxValue) : "0";
+}
+
+function isValidIntegerPayoutAmount(amount: string, max: string, min: number) {
+  const value = Number(amount);
+  const maxValue = Math.floor(Number(max));
+  return Number.isInteger(value) && Number.isFinite(maxValue) && value >= min && value <= maxValue;
+}
+
+function isGateioUid(value: string) {
+  return /^\d+$/.test(value.trim());
 }
 
 function looksLikeEmail(value: string) {

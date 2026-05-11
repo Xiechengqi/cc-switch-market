@@ -8,6 +8,7 @@ import {
   Activity,
   LayoutDashboard,
   PlusCircle,
+  ArrowRightLeft,
   Copy,
   Trash2,
   Pencil,
@@ -31,6 +32,7 @@ import { useDateTimeFormatter } from "@/lib/time";
 import { formatCommissionRate, usePublicConfig } from "@/lib/public-config";
 
 type WalletSummary = { user_cash_usd: string; user_reserved_usd: string };
+type ClaimSummary = { available_usd: string };
 type ApiKeyItem = {
   id: string;
   name: string;
@@ -63,6 +65,7 @@ type PriceItem = {
 type AvailableShareItem = {
   router_id: string;
   share_id: string;
+  owner_email?: string | null;
   subdomain?: string | null;
   app_type: string;
   capabilities: string[];
@@ -79,9 +82,7 @@ type ApiKeyLimitFormValue = {
   expiresAt: string;
   spendMode: "unlimited" | "custom";
   monthlySpendCap: string;
-  modelMode: "unlimited" | "custom";
-  selectedModelIds: string[];
-  selectedModelKeys: string[];
+  selectedVendorKeys: string[];
 };
 type MoneyEvent = {
   id?: string;
@@ -103,6 +104,10 @@ type UsageItem = {
   request_id?: string;
   model?: string;
   app_type?: string;
+  request_agent?: string;
+  requested_model?: string;
+  actual_model?: string;
+  actual_model_source?: string;
   share_subdomain?: string | null;
   status?: string;
   input_tokens?: number;
@@ -124,6 +129,39 @@ type TicketItem = {
 
 const USER_TABLE_PAGE_SIZE_KEY = "cc-switch-market:user-table-page-size";
 const USER_TABLE_PAGE_SIZE_OPTIONS = [10, 20, 50, 100];
+const AGENT_MODEL_VENDOR_OPTIONS = [
+  {
+    agent: "claude",
+    label: "Claude",
+    vendors: [
+      { id: "anthropic", label: "Anthropic" },
+      { id: "openai", label: "OpenAI" },
+      { id: "gemini", label: "Gemini" },
+      { id: "deepseek", label: "DeepSeek" },
+    ],
+  },
+  {
+    agent: "codex",
+    label: "Codex",
+    vendors: [
+      { id: "openai", label: "OpenAI" },
+      { id: "anthropic", label: "Anthropic" },
+      { id: "gemini", label: "Gemini" },
+      { id: "deepseek", label: "DeepSeek" },
+    ],
+  },
+  {
+    agent: "gemini",
+    label: "Gemini",
+    vendors: [
+      { id: "gemini", label: "Gemini" },
+      { id: "openai", label: "OpenAI" },
+      { id: "anthropic", label: "Anthropic" },
+      { id: "deepseek", label: "DeepSeek" },
+    ],
+  },
+] as const;
+const DEFAULT_AGENT_VENDOR_KEYS = ["claude:anthropic", "codex:openai", "gemini:gemini"];
 
 function ConsoleDataTable<T>(props: DataTableProps<T>) {
   const { locale } = useLocale();
@@ -244,8 +282,8 @@ function Overview() {
 
 function formatWalletUsd(value: string | null | undefined): string {
   const amount = Number(value ?? 0);
-  if (!Number.isFinite(amount) || amount === 0) return "$0";
-  return `$${String(value ?? "0").replace(/(\.\d*?[1-9])0+$/, "$1").replace(/\.0+$/, "")}`;
+  if (!Number.isFinite(amount)) return "$0.00";
+  return `$${amount.toFixed(2)}`;
 }
 
 function WalletTab() {
@@ -254,12 +292,17 @@ function WalletTab() {
   const c = copy[locale].dashboard;
   const publicConfig = usePublicConfig();
   const [summary, setSummary] = useState<WalletSummary | null>(null);
+  const [claimSummary, setClaimSummary] = useState<ClaimSummary | null>(null);
   const [items, setItems] = useState<MoneyEvent[] | null>(null);
   const [topupOpen, setTopupOpen] = useState(false);
+  const [transferOpen, setTransferOpen] = useState(false);
   const formatDate = useDateTimeFormatter();
+  const claimAvailable = claimSummary?.available_usd ?? "0";
+  const canTransferClaim = Number(claimAvailable) > 0;
 
   function reload() {
     apiGet<WalletSummary>("/v1/wallet/summary").then(setSummary).catch(() => setSummary({ user_cash_usd: "0", user_reserved_usd: "0" }));
+    apiGet<ClaimSummary>("/v1/provider/claim/summary").then(setClaimSummary).catch(() => setClaimSummary({ available_usd: "0" }));
     apiGetAllItems<MoneyEvent>("/v1/wallet/ledger").then(setItems).catch(() => setItems([]));
   }
   useEffect(() => { reload(); }, []);
@@ -305,12 +348,19 @@ function WalletTab() {
         <div className="flex flex-wrap items-end justify-between gap-4">
           <div>
             <div className="text-xs font-bold uppercase tracking-wider text-slate-500">{c.wallet.balance}</div>
-            <div className="mt-1 font-display text-5xl font-extrabold">${summary?.user_cash_usd ?? "0.00"}</div>
-            <div className="mt-1 text-sm text-slate-500">{c.wallet.lockedPrefix} ${summary?.user_reserved_usd ?? "0.00"}</div>
+            <div className="mt-1 max-w-full break-words font-display text-4xl font-extrabold leading-tight sm:text-5xl">{formatWalletUsd(summary?.user_cash_usd)}</div>
+            <div className="mt-1 max-w-full break-words text-sm text-slate-500">{c.wallet.lockedPrefix} {formatWalletUsd(summary?.user_reserved_usd)}</div>
           </div>
-          <button className="inline-flex items-center gap-2 rounded-full border-2 border-slate-800 bg-violet-500 px-5 py-3 font-bold text-white btn-pop" onClick={() => setTopupOpen(true)}>
-            <PlusCircle size={16} /> {c.wallet.topup}
-          </button>
+          <div className="flex flex-wrap gap-2">
+            {canTransferClaim && (
+              <button className="inline-flex items-center gap-2 rounded-full border-2 border-slate-800 bg-emerald-300 px-5 py-3 font-bold text-slate-900 lift" onClick={() => setTransferOpen(true)}>
+                <ArrowRightLeft size={16} /> {c.wallet.transferClaim}
+              </button>
+            )}
+            <button className="inline-flex items-center gap-2 rounded-full border-2 border-slate-800 bg-violet-500 px-5 py-3 font-bold text-white btn-pop" onClick={() => setTopupOpen(true)}>
+              <PlusCircle size={16} /> {c.wallet.topup}
+            </button>
+          </div>
         </div>
       </div>
       <ConsoleDataTable
@@ -327,6 +377,7 @@ function WalletTab() {
         ]}
       />
       <TopupModal open={topupOpen} onClose={() => { setTopupOpen(false); reload(); }} isFirstTopup={!hasSuccessfulTopup(items)} />
+      <TransferClaimModal open={transferOpen} onClose={() => { setTransferOpen(false); reload(); }} max={claimAvailable} />
     </div>
   );
 }
@@ -414,6 +465,83 @@ function TopupModal({ open, onClose, isFirstTopup }: { open: boolean; onClose: (
               <button key={v} type="button" onClick={() => form.setValue("amount", v, { shouldDirty: true, shouldValidate: true })} className="rounded-full border-2 border-slate-800 bg-white px-3 py-1 text-sm font-bold lift">${v}</button>
             ))}
           </div>
+        </form>
+      </Form>
+    </Modal>
+  );
+}
+
+function TransferClaimModal({ open, onClose, max }: { open: boolean; onClose: () => void; max: string }) {
+  const toast = useToast();
+  const { locale } = useLocale();
+  const c = copy[locale].dashboard.wallet;
+  const [submitting, setSubmitting] = useState(false);
+  const form = useForm<{ amount: string }>({ defaultValues: { amount: max } });
+
+  useEffect(() => {
+    if (open) form.reset({ amount: max });
+  }, [open, max, form]);
+
+  async function submit(values: { amount: string }) {
+    const amount = values.amount;
+    const value = Number(amount);
+    const maxValue = Number(max);
+    if (!Number.isFinite(value) || !Number.isFinite(maxValue) || value <= 0 || value > maxValue) {
+      form.setError("amount", { type: "validate", message: c.transferClaimInvalidDesc });
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await apiPost("/v1/provider/claim/convert-to-balance", { amount_usd: amount });
+      toast.push({ variant: "success", title: c.transferClaimSuccess });
+      onClose();
+    } catch (err) {
+      toast.push({ variant: "error", title: c.transferClaimErrorTitle, description: String(err).replace(/^Error:\s*/, "") });
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={c.transferClaimModalTitle}
+      description={c.transferClaimModalDesc}
+      footer={
+        <>
+          <button type="button" onClick={onClose} className="rounded-full border-2 border-slate-800 bg-white px-5 py-2 font-bold lift">{c.topupCancel}</button>
+          <button type="submit" form="transfer-claim-form" disabled={submitting} className="rounded-full border-2 border-slate-800 bg-emerald-300 px-5 py-2 font-bold text-slate-900 btn-pop disabled:opacity-50">
+            {submitting ? c.transferClaimSubmitting : c.transferClaimSubmit}
+          </button>
+        </>
+      }
+    >
+      <Form {...form}>
+        <form id="transfer-claim-form" onSubmit={form.handleSubmit(submit)} className="grid gap-3">
+          <div className="rounded-2xl border-2 border-slate-800 bg-amber-50 p-3 text-sm font-bold">
+            {c.transferClaimAvailable(max)}
+          </div>
+          <FormField
+            control={form.control}
+            name="amount"
+            rules={{ required: c.transferClaimInvalidDesc }}
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel className="text-xs font-bold uppercase tracking-wider text-slate-600">{c.transferClaimAmountLabel}</FormLabel>
+                <FormControl>
+                  <input
+                    type="number"
+                    min="0.01"
+                    step="0.01"
+                    {...field}
+                    className="rounded-2xl border-2 border-slate-800 bg-amber-50 px-4 py-3 text-2xl font-bold outline-none focus:bg-white"
+                  />
+                </FormControl>
+                <FormMessage className="text-xs font-bold text-pink-600" />
+              </FormItem>
+            )}
+          />
         </form>
       </Form>
     </Modal>
@@ -620,44 +748,18 @@ function EditKeyModal({ target, onClose, onDone }: { target: ApiKeyItem | null; 
 function ApiKeyLimitFields({ value, onChange, prices }: { value: ApiKeyLimitFormValue; onChange: (value: ApiKeyLimitFormValue) => void; prices: PriceItem[] | null }) {
   const { locale } = useLocale();
   const c = copy[locale].dashboard.keys;
-  const modelOptions = (prices ?? [])
-    .filter((price) => price.model_id && price.model_pattern !== "*")
-    .sort((a, b) => `${a.app_type}:${a.model_pattern}`.localeCompare(`${b.app_type}:${b.model_pattern}`));
 
   function patch(next: Partial<ApiKeyLimitFormValue>) {
     onChange({ ...value, ...next });
   }
 
-  function toggleModel(modelId: string) {
+  function toggleVendorKey(key: string) {
     patch({
-      selectedModelIds: value.selectedModelIds.includes(modelId)
-        ? value.selectedModelIds.filter((id) => id !== modelId)
-        : [...value.selectedModelIds, modelId],
+      selectedVendorKeys: value.selectedVendorKeys.includes(key)
+        ? value.selectedVendorKeys.filter((item) => item !== key)
+        : [...value.selectedVendorKeys, key],
     });
   }
-  function toggleModelKey(key: string) {
-    patch({
-      selectedModelKeys: value.selectedModelKeys.includes(key)
-        ? value.selectedModelKeys.filter((item) => item !== key)
-        : [...value.selectedModelKeys, key],
-    });
-  }
-
-  const modelAccessOptions = [
-    { app: "claude", slot: "default", label: "Claude default" },
-    { app: "claude", slot: "haiku", label: "Claude haiku" },
-    { app: "claude", slot: "sonnet", label: "Claude sonnet" },
-    { app: "claude", slot: "opus", label: "Claude opus" },
-    { app: "codex", slot: "model", label: "Codex" },
-    { app: "gemini", slot: "model", label: "Gemini" },
-  ].flatMap((slot) =>
-    modelOptions.map((price) => ({
-      ...slot,
-      model: price.model_pattern,
-      key: `${slot.app}:${slot.slot}:${price.model_pattern}`,
-      price,
-    })),
-  );
 
   return (
     <div className="mt-4 grid gap-4">
@@ -697,37 +799,27 @@ function ApiKeyLimitFields({ value, onChange, prices }: { value: ApiKeyLimitForm
             <div className="font-bold">{c.modelScopeLabel}</div>
             <div className="text-xs text-slate-500">{c.modelScopeHint}</div>
           </div>
-          <select value={value.modelMode} onChange={(e) => patch({ modelMode: e.target.value as "unlimited" | "custom" })} className="rounded-2xl border-2 border-slate-800 bg-amber-50 px-3 py-2 font-bold">
-            <option value="unlimited">{c.unlimited}</option>
-            <option value="custom">{c.custom}</option>
-          </select>
         </div>
-        {value.modelMode === "custom" && (
-          <div className="mt-3 max-h-56 overflow-auto rounded-2xl border-2 border-slate-800 bg-amber-50 p-3">
-            {prices === null && <div className="text-sm text-slate-500">{c.modelsLoading}</div>}
-            {prices && modelOptions.length === 0 && <div className="text-sm text-slate-500">{c.modelsEmpty}</div>}
-            {modelAccessOptions.map((option) => {
-              const checked = value.selectedModelKeys.includes(option.key);
-              return (
-                <label key={option.key} className="mb-2 flex cursor-pointer items-center gap-3 rounded-xl border-2 border-slate-200 bg-white px-3 py-2 text-sm font-bold last:mb-0">
-                  <input type="checkbox" checked={checked} onChange={() => toggleModelKey(option.key)} />
-                  <span className="rounded-full bg-violet-100 px-2 py-0.5 text-xs uppercase">{option.label}</span>
-                  <span className="font-mono">{option.price.display_name || option.model}</span>
-                </label>
-              );
-            })}
-            {false && modelOptions.map((price) => {
-              const modelId = String(price.model_id);
-              return (
-                <label key={modelId} className="mb-2 flex cursor-pointer items-center gap-3 rounded-xl border-2 border-slate-200 bg-white px-3 py-2 text-sm font-bold last:mb-0">
-                  <input type="checkbox" checked={value.selectedModelIds.includes(modelId)} onChange={() => toggleModel(modelId)} />
-                  <span className="rounded-full bg-violet-100 px-2 py-0.5 text-xs uppercase">{price.app_type}</span>
-                  <span className="font-mono">{price.display_name || price.model_pattern}</span>
-                </label>
-              );
-            })}
-          </div>
-        )}
+        <div className="mt-3 grid gap-3 rounded-2xl border-2 border-slate-800 bg-amber-50 p-3">
+          {prices === null && <div className="text-sm text-slate-500">{c.modelsLoading}</div>}
+          {prices && AGENT_MODEL_VENDOR_OPTIONS.map((agent) => (
+            <div key={agent.agent} className="rounded-xl border-2 border-slate-200 bg-white p-3">
+              <div className="mb-2 text-sm font-black">{agent.label}</div>
+              <div className="flex flex-wrap gap-2">
+                {agent.vendors.map((vendor) => {
+                  const key = `${agent.agent}:${vendor.id}`;
+                  const checked = value.selectedVendorKeys.includes(key);
+                  return (
+                    <label key={key} className="inline-flex cursor-pointer items-center gap-2 rounded-full border-2 border-slate-800 bg-amber-50 px-3 py-1.5 text-xs font-bold">
+                      <input type="checkbox" checked={checked} onChange={() => toggleVendorKey(key)} />
+                      <span>{vendor.label}</span>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   );
@@ -739,23 +831,18 @@ function emptyLimitForm(): ApiKeyLimitFormValue {
     expiresAt: "",
     spendMode: "unlimited",
     monthlySpendCap: "",
-    modelMode: "unlimited",
-    selectedModelIds: [],
-    selectedModelKeys: [],
+    selectedVendorKeys: DEFAULT_AGENT_VENDOR_KEYS,
   };
 }
 
 function limitFormFromApiKey(item: ApiKeyItem): ApiKeyLimitFormValue {
-  const modelIds = apiKeyModelIds(item.scope_json);
-  const modelKeys = apiKeyModelKeys(item.scope_json);
+  const vendorKeys = apiKeyVendorKeys(item.scope_json);
   return {
     expiresMode: item.expires_at ? "custom" : "unlimited",
     expiresAt: item.expires_at ? toDateTimeLocalValue(item.expires_at) : "",
     spendMode: item.monthly_spend_cap ? "custom" : "unlimited",
     monthlySpendCap: item.monthly_spend_cap ? trimMoney(item.monthly_spend_cap) : "",
-    modelMode: modelIds || modelKeys ? "custom" : "unlimited",
-    selectedModelIds: modelIds ?? [],
-    selectedModelKeys: modelKeys ?? [],
+    selectedVendorKeys: vendorKeys ?? DEFAULT_AGENT_VENDOR_KEYS,
   };
 }
 
@@ -763,14 +850,14 @@ function buildLimitPayload(value: ApiKeyLimitFormValue): Record<string, unknown>
   return {
     expires_at: value.expiresMode === "custom" ? new Date(value.expiresAt).toISOString() : null,
     monthly_spend_cap: value.spendMode === "custom" ? value.monthlySpendCap : null,
-    scope_json: value.modelMode === "custom" ? { model_access: modelAccessFromKeys(value.selectedModelKeys) } : null,
+    scope_json: { agent_model_vendors: agentModelVendorsFromKeys(value.selectedVendorKeys) },
   };
 }
 
 function isLimitFormSubmittable(value: ApiKeyLimitFormValue): boolean {
   return !(value.expiresMode === "custom" && !value.expiresAt)
     && !(value.spendMode === "custom" && value.monthlySpendCap === "")
-    && !(value.modelMode === "custom" && value.selectedModelKeys.length === 0);
+    && value.selectedVendorKeys.length > 0;
 }
 
 function apiKeyModelIds(scope: unknown): string[] | null {
@@ -797,15 +884,28 @@ function apiKeyModelKeys(scope: unknown): string[] | null {
   return keys.length ? keys : null;
 }
 
-function modelAccessFromKeys(keys: string[]): Record<string, Record<string, string[]>> {
-  const access: Record<string, Record<string, string[]>> = {};
+function apiKeyVendorKeys(scope: unknown): string[] | null {
+  if (!scope || typeof scope !== "object") return null;
+  const access = (scope as { agent_model_vendors?: unknown; agentModelVendors?: unknown }).agent_model_vendors
+    ?? (scope as { agentModelVendors?: unknown }).agentModelVendors;
+  if (!access || typeof access !== "object") return null;
+  const keys: string[] = [];
+  for (const [agent, vendors] of Object.entries(access as Record<string, unknown>)) {
+    if (!Array.isArray(vendors)) continue;
+    for (const vendor of vendors) {
+      if (typeof vendor === "string") keys.push(`${agent}:${vendor}`);
+    }
+  }
+  return keys.length ? keys : null;
+}
+
+function agentModelVendorsFromKeys(keys: string[]): Record<string, string[]> {
+  const access: Record<string, string[]> = {};
   for (const key of keys) {
-    const [app, slot, ...modelParts] = key.split(":");
-    const model = modelParts.join(":");
-    if (!app || !slot || !model) continue;
-    access[app] ??= {};
-    access[app][slot] ??= [];
-    if (!access[app][slot].includes(model)) access[app][slot].push(model);
+    const [agent, vendor] = key.split(":");
+    if (!agent || !vendor) continue;
+    access[agent] ??= [];
+    if (!access[agent].includes(vendor)) access[agent].push(vendor);
   }
   return access;
 }
@@ -851,7 +951,7 @@ function ApiKeyLimits({ item }: { item: ApiKeyItem }) {
 }
 
 function apiKeyModelCount(scope: unknown): number | null {
-  return apiKeyModelKeys(scope)?.length ?? apiKeyModelIds(scope)?.length ?? null;
+  return apiKeyVendorKeys(scope)?.length ?? apiKeyModelKeys(scope)?.length ?? apiKeyModelIds(scope)?.length ?? 3;
 }
 
 function trimMoney(value: string): string {
@@ -976,12 +1076,52 @@ function ShareAllowlistModal({ target, onClose, onDone }: { target: ApiKeyItem |
   }
 
   const rows = available ?? [];
+  const ownerGroups = Array.from(new Set(rows.map((item) => item.owner_email || "").filter(Boolean))).sort();
+  function selectOwner(ownerEmail: string) {
+    const ownerKeys = rows
+      .filter((item) => item.owner_email === ownerEmail)
+      .map(shareKey);
+    setSelected((current) => Array.from(new Set([...current, ...ownerKeys])));
+  }
+  function removeOwner(ownerEmail: string) {
+    const ownerKeys = new Set(rows
+      .filter((item) => item.owner_email === ownerEmail)
+      .map(shareKey));
+    setSelected((current) => current.filter((key) => !ownerKeys.has(key)));
+  }
+  function replaceWithOwner(ownerEmail: string) {
+    setSelected(rows.filter((item) => item.owner_email === ownerEmail).map(shareKey));
+  }
   return (
     <Modal open={!!target} onClose={onClose} title={c.shareTitle} description={target ? c.shareDesc(target.name, target.prefix) : ""} width="lg">
       <div className="grid gap-4">
         <div className="rounded-2xl border-2 border-slate-800 bg-amber-50 p-3 text-sm font-bold">
           {selected.length === 0 ? c.shareAutoMode : c.shareLimitedMode(selected.length)}
         </div>
+        {ownerGroups.length > 0 && (
+          <div className="rounded-2xl border-2 border-slate-800 bg-white p-3">
+            <div className="mb-2 text-xs font-black uppercase tracking-wider text-slate-600">{c.shareOwnerQuickSelect}</div>
+            <div className="flex flex-wrap gap-2">
+              {ownerGroups.map((owner) => {
+                const ownerKeys = rows.filter((item) => item.owner_email === owner).map(shareKey);
+                const ownerSelected = ownerKeys.length > 0 && ownerKeys.every((key) => selected.includes(key));
+                return (
+                  <span key={owner} className="inline-flex items-center gap-1 rounded-full border-2 border-slate-800 bg-amber-50 px-2 py-1 text-xs">
+                    <span className="font-mono font-bold">{owner}</span>
+                    <button
+                      type="button"
+                      onClick={() => ownerSelected ? removeOwner(owner) : selectOwner(owner)}
+                      className={`rounded-full px-2 py-0.5 font-bold text-white ${ownerSelected ? "bg-pink-500" : "bg-violet-500"}`}
+                    >
+                      {ownerSelected ? c.shareOwnerRemove : c.shareOwnerAdd}
+                    </button>
+                    <button type="button" onClick={() => replaceWithOwner(owner)} className="rounded-full bg-slate-900 px-2 py-0.5 font-bold text-white">{c.shareOwnerOnly}</button>
+                  </span>
+                );
+              })}
+            </div>
+          </div>
+        )}
         <div className="max-h-96 overflow-auto rounded-2xl border-2 border-slate-800 bg-white p-3">
           {available === null && <div className="text-sm text-slate-500">{c.sharesLoading}</div>}
           {available && rows.length === 0 && <div className="text-sm text-slate-500">{c.sharesEmpty}</div>}
@@ -997,6 +1137,7 @@ function ShareAllowlistModal({ target, onClose, onDone }: { target: ApiKeyItem |
                     {!item.online && <span className="rounded-full bg-pink-100 px-2 py-0.5 text-xs font-bold">{c.shareOffline}</span>}
                   </div>
                   <div className="mt-1 break-all font-mono text-xs text-slate-500">{item.router_id} / {item.share_id}</div>
+                  <div className="mt-1 break-all font-mono text-xs font-bold text-slate-700">{c.shareOwner}: {item.owner_email || "-"}</div>
                   <div className="mt-2 flex flex-wrap gap-1">
                     {item.capabilities.map((capability) => (
                       <span key={capability} className="rounded-full bg-violet-100 px-2 py-0.5 text-[11px] font-bold uppercase">{capability}</span>
@@ -1063,7 +1204,7 @@ function UsageTab() {
         rowClassName={(r) => r.status === "needs_review" ? "bg-pink-50" : ""}
         columns={[
           { key: "rid", header: c.colRequest, render: (r) => <span className="font-mono text-xs break-all">{r.request_id}</span> },
-          { key: "model", header: c.colModel, render: (r) => <span><span className="rounded-full bg-violet-100 border border-slate-800 px-2 py-0.5 text-xs font-bold uppercase mr-1">{r.app_type}</span><span className="font-mono text-sm">{r.model}</span></span> },
+          { key: "model", header: c.colModel, render: (r) => <span><span className="rounded-full bg-violet-100 border border-slate-800 px-2 py-0.5 text-xs font-bold uppercase mr-1">{r.request_agent ?? r.app_type}</span><span className="font-mono text-sm">{r.actual_model ?? r.model}</span><span className="ml-1 text-xs text-slate-500">({r.requested_model ?? r.model})</span></span> },
           { key: "share", header: c.colShare, render: (r) => r.share_subdomain ? <span className="rounded-full border border-slate-800 bg-amber-100 px-2 py-0.5 font-mono text-xs font-bold">{r.share_subdomain}</span> : <span /> },
           { key: "tokens", header: c.colTokens, render: (r) => <span className="text-xs text-slate-600">in {r.input_tokens ?? 0} · out {r.output_tokens ?? 0}</span> },
           { key: "amount", header: c.colAmount, render: (r) => <span className="font-mono">${r.gross_amount ?? r.usage_amount ?? r.reserved_amount ?? "0"}</span> },

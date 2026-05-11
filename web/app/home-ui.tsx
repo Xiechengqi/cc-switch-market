@@ -41,12 +41,13 @@ type Price = {
   official_output_per_million?: string | null;
   official_cache_read_per_million?: string | null;
   official_cache_write_per_million?: string | null;
+  discount_percent?: string | number | null;
   status?: string;
 };
 
-type PriceProvider = "anthropic" | "openai" | "gemini";
+type PriceProvider = "anthropic" | "openai" | "gemini" | "deepseek";
 
-const PRICE_PROVIDERS: PriceProvider[] = ["anthropic", "openai", "gemini"];
+const PRICE_PROVIDERS: PriceProvider[] = ["anthropic", "openai", "gemini", "deepseek"];
 const PRICE_PAGE_SIZE = 6;
 
 export function HomeHero() {
@@ -255,7 +256,6 @@ export function PricingTable() {
   const { locale } = useLocale();
   const c = copy[locale].landing;
   const publicConfig = usePublicConfig();
-  const commission = commissionText(locale, publicConfig.totalCommissionBps);
   const [prices, setPrices] = useState<Price[] | null>(null);
   const [activeProvider, setActiveProvider] = useState<PriceProvider>("anthropic");
   const [page, setPage] = useState(0);
@@ -276,13 +276,17 @@ export function PricingTable() {
     currentPage * PRICE_PAGE_SIZE,
     currentPage * PRICE_PAGE_SIZE + PRICE_PAGE_SIZE
   );
+  const activeDiscount = providerPrices.find((price) => price.discount_percent !== undefined)?.discount_percent ?? 10;
+  const totalTake = commissionText(locale, publicConfig.totalCommissionBps).rate;
+  const pricingBadge = locale === "zh"
+    ? `官方价 ${formatDiscountPercent(activeDiscount)} · ${totalTake} 总抽成`
+    : `${formatDiscountPercent(activeDiscount)} official price · ${totalTake} total take`;
 
   const cols = c.pricingCol;
 
   return (
     <section id="pricing" className="relative mx-auto max-w-6xl scroll-mt-20 bg-stripes-soft px-6 py-16">
       <h2 className="font-display text-4xl font-extrabold md:text-5xl">{c.pricingTitle}</h2>
-      <p className="mt-2 text-slate-600">{commission.pricingSubtitle}</p>
       <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap gap-2">
           {PRICE_PROVIDERS.map((provider) => {
@@ -304,7 +308,7 @@ export function PricingTable() {
         </div>
         <div className="inline-flex items-center gap-2 rounded-full border-2 border-slate-800 bg-amber-300 px-3 py-1.5 text-sm font-extrabold text-slate-900">
           <Star size={14} />
-          <span>{commission.pricingBadge}</span>
+          <span>{pricingBadge}</span>
         </div>
       </div>
 
@@ -453,6 +457,12 @@ function comparePriceDesc(left: Price, right: Price): number {
 function priceNumber(value?: string | null): number {
   const parsed = Number(value ?? 0);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function formatDiscountPercent(value: string | number | null | undefined): string {
+  const parsed = Number(value ?? 10);
+  if (!Number.isFinite(parsed)) return "10%";
+  return `${parsed.toFixed(2).replace(/0+$/, "").replace(/\.$/, "")}%`;
 }
 
 function trimDecimal(value: string): string {

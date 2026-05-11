@@ -418,16 +418,16 @@ function TicketDetails({ id, onChanged, onDeleted }: { id: string; onChanged: ()
   const sendingLabel = locale === "zh" ? "发送中…" : "Sending…";
   const sendLabel = locale === "zh" ? "发送回复" : "Send reply";
   const closedNote = locale === "zh"
-    ? "该工单已关闭，如有新问题请新建工单。"
+    ? "该工单已关闭，如有新问题请新建工单"
     : "This ticket is closed. Open a new one if anything else comes up.";
   const closeDesc = locale === "zh"
-    ? "关闭后无法继续回复，但记录会保留。"
+    ? "关闭后无法继续回复，但记录会保留"
     : "After closing, replies are blocked but the record stays.";
   const deleteDesc = locale === "zh"
-    ? "该工单尚未被管理员回复，可彻底删除。删除后所有消息与附件不可恢复。"
+    ? "该工单尚未被管理员回复，可彻底删除。删除后所有消息与附件不可恢复"
     : "Tickets without admin replies can be deleted permanently. Messages and attachments cannot be recovered.";
   const internalNoteLabel = locale === "zh" ? "内部备注" : "Internal note";
-  const noMessagesYet = locale === "zh" ? "暂无消息。" : "No messages yet.";
+  const noMessagesYet = locale === "zh" ? "暂无消息" : "No messages yet.";
 
   return (
     <div className="grid gap-4">

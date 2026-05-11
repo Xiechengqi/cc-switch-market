@@ -7,13 +7,15 @@ import { readAnnouncements, readSeenAnnouncementIds } from "@/lib/site-announcem
 
 export function AnnouncementButton({ iconOnly = false }: { iconOnly?: boolean }) {
   const [open, setOpen] = useState(false);
-  const [items, setItems] = useState(readAnnouncements);
-  const [seen, setSeen] = useState(readSeenAnnouncementIds);
+  const [ready, setReady] = useState(false);
+  const [items, setItems] = useState<ReturnType<typeof readAnnouncements>>([]);
+  const [seen, setSeen] = useState<string[]>([]);
 
   useEffect(() => {
     function refresh() {
       setItems(readAnnouncements());
       setSeen(readSeenAnnouncementIds());
+      setReady(true);
     }
     refresh();
     window.addEventListener("cc-switch-market:announcements-updated", refresh as EventListener);
@@ -41,7 +43,7 @@ export function AnnouncementButton({ iconOnly = false }: { iconOnly?: boolean })
         className={`relative inline-flex items-center justify-center rounded-full border-2 border-[var(--border)] bg-[var(--card)] font-bold text-[var(--foreground)] lift ${iconOnly ? "h-10 w-10" : "px-3 py-2 text-sm"}`}
       >
         <Bell size={16} />
-        {unreadCount > 0 && (
+        {ready && unreadCount > 0 && (
           <span className="absolute -right-1 -top-1 inline-flex min-w-5 items-center justify-center rounded-full border-2 border-[var(--border)] bg-pink-400 px-1 text-[10px] font-extrabold text-white">
             {unreadCount}
           </span>

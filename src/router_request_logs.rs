@@ -22,6 +22,10 @@ struct RouterRequestLog {
     share_id: Option<String>,
     share_subdomain: Option<String>,
     model: Option<String>,
+    request_agent: String,
+    requested_model: String,
+    actual_model: String,
+    actual_model_source: String,
     status: String,
     status_code: Option<u16>,
     latency_ms: Option<u64>,
@@ -46,7 +50,9 @@ pub async fn sync_recent(state: &AppState) -> Result<usize, ApiError> {
                        json_extract(rs.raw_json, '$.apiUrl'),
                        json_extract(rs.raw_json, '$.api_url')
                    ) AS share_subdomain,
-                   rc.model, rc.status, rc.usage_amount, rc.usage_json,
+                   rc.app_type, rc.model, rc.request_agent, rc.requested_model, rc.actual_model, rc.actual_model_source,
+                   rc.pricing_model, rc.pricing_model_source,
+                   rc.status, rc.usage_amount, rc.usage_json,
                    rc.created_at, rc.settled_at,
                    ra.latency_ms
               FROM request_charges rc
@@ -87,6 +93,20 @@ pub async fn sync_recent(state: &AppState) -> Result<usize, ApiError> {
                 share_id: row.opt_string("share_id"),
                 share_subdomain: row.opt_string("share_subdomain"),
                 model: row.opt_string("model"),
+                request_agent: row.opt_string("request_agent").unwrap_or_else(|| {
+                    request_agent_for_app_type(&row.string("app_type")).to_string()
+                }),
+                requested_model: row
+                    .opt_string("requested_model")
+                    .unwrap_or_else(|| row.string("model")),
+                actual_model: row
+                    .opt_string("actual_model")
+                    .or_else(|| row.opt_string("pricing_model"))
+                    .unwrap_or_else(|| row.string("model")),
+                actual_model_source: row
+                    .opt_string("actual_model_source")
+                    .or_else(|| row.opt_string("pricing_model_source"))
+                    .unwrap_or_else(|| "official".to_string()),
                 status: row.string("status"),
                 status_code: status_code_for_charge(&row.string("status")),
                 latency_ms: row
@@ -179,6 +199,14 @@ async fn mark_sync_error(state: &AppState, logs: &[RouterRequestLog], message: S
 
 fn usage_number(value: &Value, key: &str) -> u64 {
     value.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn request_agent_for_app_type(app_type: &str) -> &'static str {
+    match app_type {
+        "anthropic" | "claude" => "claude",
+        "gemini" => "gemini",
+        _ => "codex",
+    }
 }
 
 fn status_code_for_charge(status: &str) -> Option<u16> {

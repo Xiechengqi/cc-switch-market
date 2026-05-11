@@ -21,17 +21,17 @@ type StatCardProps = {
 export function StatCard({ label, value, sublabel, icon, color = "violet", loading }: StatCardProps) {
   const c = COLOR_MAP[color];
   return (
-    <div className={`relative rounded-3xl border-2 border-slate-800 bg-white p-5 ${c.shadow} lift`}>
+    <div className={`relative min-w-0 rounded-3xl border-2 border-slate-800 bg-white p-5 ${c.shadow} lift`}>
       {icon && (
         <div className={`absolute -top-4 -right-3 rounded-full border-2 border-slate-800 ${c.icon} p-2`}>
           {icon}
         </div>
       )}
       <div className="text-xs font-bold uppercase tracking-wider text-slate-500">{label}</div>
-      <div className="mt-2 font-display text-3xl font-extrabold md:text-4xl">
+      <div className="mt-2 min-w-0 overflow-hidden break-words font-display text-2xl font-extrabold leading-tight md:text-3xl">
         {loading ? <span className={`inline-block h-9 w-28 rounded-lg ${c.ring} animate-pulse`} /> : value}
       </div>
-      {sublabel && <div className="mt-1 text-sm text-slate-500">{sublabel}</div>}
+      {sublabel && <div className="mt-1 min-w-0 break-words text-sm text-slate-500">{sublabel}</div>}
     </div>
   );
 }

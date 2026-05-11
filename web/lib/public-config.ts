@@ -104,10 +104,10 @@ export function commissionText(locale: "zh" | "en", bps: number) {
       short: `${rate} 平台抽成`,
       heroBadge: `官方参考价 1/10 · ${rate} 总抽成 · 30 秒上手`,
       featureTitle: `${rate} 平台抽成`,
-      featureBody: `用户消费按公开价格结算，${rate} 进入平台收入，其余净额归 Provider。`,
+      featureBody: `用户消费按公开价格结算，${rate} 进入平台收入，其余净额归 Provider`,
       pricingBadge: `官方价 1/10 · ${rate} 总抽成`,
-      pricingSubtitle: `Market 调用价按官方参考价 1/10 展示；Provider 收入 = 用户消费金额 - ${rate} 总抽成。`,
-      claimNote: `当前总抽成为 ${rate}，收益按 gross - Market fee - Router fee 入账。`,
+      pricingSubtitle: `Market 调用价按官方参考价 1/10 展示；Provider 收入 = 用户消费金额 - ${rate} 总抽成`,
+      claimNote: `当前总抽成为 ${rate}，收益按 gross - Market fee - Router fee 入账`,
       adminLabel: "平台抽成",
     };
   }

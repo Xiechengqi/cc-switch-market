@@ -1,6 +1,8 @@
 /target
 /.env
 /web/.next
+/web/out
+/web/tsconfig.tsbuildinfo
 /web/node_modules
 /web/.env.local
 /cc-switch-market

@@ -45,7 +45,7 @@ export function AdminGuard({ children }: AdminGuardProps) {
             <KeyRound size={24} />
           </div>
           <div className="font-display text-2xl font-extrabold">需要先登录</div>
-          <div className="mt-2 text-sm text-slate-600">请使用管理员邮箱登录后再访问此页面。</div>
+          <div className="mt-2 text-sm text-slate-600">请使用管理员邮箱登录后再访问此页面</div>
           <button
             onClick={showLogin}
             className="mt-4 inline-flex items-center gap-2 rounded-full border-2 border-slate-800 bg-violet-500 px-5 py-2 font-bold text-white btn-pop"
@@ -65,7 +65,7 @@ export function AdminGuard({ children }: AdminGuardProps) {
             <ShieldAlert size={24} />
           </div>
           <div className="font-display text-2xl font-extrabold">权限不足</div>
-          <div className="mt-2 text-sm text-slate-600">此页面仅管理员可访问。</div>
+          <div className="mt-2 text-sm text-slate-600">此页面仅管理员可访问</div>
         </div>
       </div>
     );

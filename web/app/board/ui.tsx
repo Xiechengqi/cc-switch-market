@@ -1,9 +1,8 @@
 "use client";
 
-import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import dynamic from "next/dynamic";
-import { ArrowRight, Coins, Cpu, Layers, RefreshCw, ShieldAlert, Sparkles, Users } from "lucide-react";
+import { Coins, Cpu, Layers, RefreshCw, ShieldAlert, Sparkles, Users } from "lucide-react";
 import { apiGet } from "@/lib/client-api";
 import { copy } from "@/lib/copy";
 import { useLocale } from "@/components/language-provider";
@@ -11,6 +10,7 @@ import { Skeleton } from "@/components/ui/Skeleton";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { DataTable, type Column } from "@/components/ui/DataTable";
 import { Confetti } from "@/components/ui/Confetti";
+import { useMarketAuth } from "@/components/auth";
 
 const MemphisLineChart = dynamic(() => import("@/components/charts/MemphisLineChart").then((m) => m.MemphisLineChart), { ssr: false, loading: () => <Skeleton className="h-72 w-full rounded-2xl" /> });
 const MemphisPieChart = dynamic(() => import("@/components/charts/MemphisPieChart").then((m) => m.MemphisPieChart), { ssr: false, loading: () => <Skeleton className="h-64 w-full rounded-2xl" /> });
@@ -38,7 +38,7 @@ type TrendResponse = {
 type BreakdownBucket = { name: string; spendUsd: string; requests: number };
 type BreakdownResponse = { dim: string; days: number; buckets: BreakdownBucket[] };
 
-type ModelRow = { appType: string; model: string; spendUsd: string; requests: number; uniqueUsers: number };
+type ModelRow = { appType: string; model: string; spendUsd: string; totalUsage: number; requests: number; uniqueUsers: number };
 type ProviderRow = { ownerEmail: string; grossSpendUsd: string; requests: number; uniqueShares: number };
 type UserRow = { email: string; spendUsd: string; requests: number };
 
@@ -68,6 +68,17 @@ function formatInt(value: number | string | undefined | null): string {
   const num = typeof value === "number" ? value : Number(value ?? 0);
   if (!Number.isFinite(num)) return "0";
   return num.toLocaleString();
+}
+
+function formatCompactCount(value: number | string | undefined | null): string {
+  const num = typeof value === "number" ? value : Number(value ?? 0);
+  if (!Number.isFinite(num)) return "0";
+  const abs = Math.abs(num);
+  const sign = num < 0 ? "-" : "";
+  if (abs >= 1_000_000_000) return `${sign}${(abs / 1_000_000_000).toFixed(1).replace(/\.0$/, "")}B`;
+  if (abs >= 1_000_000) return `${sign}${(abs / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+  if (abs >= 1_000) return `${sign}${(abs / 1_000).toFixed(1).replace(/\.0$/, "")}K`;
+  return formatInt(num);
 }
 
 export function BoardRoot() {
@@ -105,9 +116,6 @@ export function BoardRoot() {
           <TopUsersCard c={c} windowKey={windowKey} refreshTick={refreshTick} />
         </div>
       </section>
-      <section className="mx-auto max-w-6xl px-6 pb-24">
-        <SelfServiceCard c={c} />
-      </section>
     </>
   );
 }
@@ -130,12 +138,21 @@ function BoardHero({ c, windowKey, onWindowChange, onRefresh, refreshing, lastUp
         <Sparkles size={14} /> Live
       </div>
       <h1 className="relative z-10 mt-3 font-display text-4xl font-extrabold leading-[1.05] md:text-6xl">{c.title}</h1>
-      <p className="relative z-10 mt-3 max-w-2xl text-base text-slate-700 md:text-lg">{c.subtitle}</p>
       <div className="relative z-10 mt-2 inline-flex items-start gap-2 rounded-2xl border-2 border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-600">
         <ShieldAlert size={14} className="mt-0.5 shrink-0 text-amber-600" /> {c.privacyNotice}
       </div>
-      <div className="relative z-10 mt-5 flex flex-wrap items-center gap-3">
-        <span className="text-xs font-bold uppercase tracking-wider text-slate-500">{c.windowLabel}</span>
+      <div className="relative z-10 mt-5 flex flex-wrap items-center justify-end gap-3">
+        {updatedLabel && <span className="text-xs text-slate-500">{updatedLabel}</span>}
+        <button
+          type="button"
+          onClick={onRefresh}
+          disabled={refreshing}
+          aria-label={c.refresh}
+          className="inline-flex items-center gap-1.5 rounded-full border-2 border-slate-800 bg-white px-3 py-1.5 text-sm font-bold hover:bg-amber-300 disabled:opacity-60"
+        >
+          <RefreshCw size={14} className={refreshing ? "motion-safe:animate-spin" : ""} />
+          {refreshing ? c.refreshing : c.refresh}
+        </button>
         <div role="tablist" aria-label={c.windowLabel} className="inline-flex rounded-full border-2 border-slate-800 bg-white p-0.5">
           {(["24h", "7d", "30d"] as WindowKey[]).map((key) => (
             <button
@@ -150,17 +167,6 @@ function BoardHero({ c, windowKey, onWindowChange, onRefresh, refreshing, lastUp
             </button>
           ))}
         </div>
-        <button
-          type="button"
-          onClick={onRefresh}
-          disabled={refreshing}
-          aria-label={c.refresh}
-          className="inline-flex items-center gap-1.5 rounded-full border-2 border-slate-800 bg-white px-3 py-1.5 text-sm font-bold hover:bg-amber-300 disabled:opacity-60"
-        >
-          <RefreshCw size={14} className={refreshing ? "motion-safe:animate-spin" : ""} />
-          {refreshing ? c.refreshing : c.refresh}
-        </button>
-        {updatedLabel && <span className="text-xs text-slate-500">{updatedLabel}</span>}
       </div>
     </section>
   );
@@ -253,7 +259,7 @@ function TrendCard({ c, refreshTick }: { c: BoardCopy; refreshTick: number }) {
       <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
         <div>
           <h2 className="font-display text-xl font-extrabold">{c.trend.title}</h2>
-          <p className="mt-0.5 text-xs text-slate-500">{c.trend.subtitle} · {TREND_DAYS}d</p>
+          <p className="mt-0.5 text-xs text-slate-500">{TREND_DAYS}d</p>
         </div>
       </div>
       {loading && !data ? (
@@ -355,6 +361,7 @@ function TopModelsCard({ c, windowKey, refreshTick }: { c: BoardCopy; windowKey:
     { key: "appType", header: c.topModels.colAppType, render: (r) => <span className="rounded-full border-2 border-slate-300 bg-white px-2 py-0.5 text-xs font-extrabold uppercase">{r.appType}</span> },
     { key: "model", header: c.topModels.colModel, render: (r) => <span className="font-mono text-sm break-all">{r.model}</span> },
     { key: "spendUsd", header: c.topModels.colSpend, render: (r) => <span className="font-mono font-extrabold">{formatMoneyFull(r.spendUsd)}</span> },
+    { key: "totalUsage", header: c.topModels.colUsage, render: (r) => <span className="font-mono">{formatCompactCount(r.totalUsage)}</span> },
     { key: "requests", header: c.topModels.colRequests, render: (r) => <span className="font-mono">{formatInt(r.requests)}</span> },
     { key: "uniqueUsers", header: c.topModels.colUsers, render: (r) => <span className="font-mono">{formatInt(r.uniqueUsers)}</span> },
   ];
@@ -378,9 +385,11 @@ function TopModelsCard({ c, windowKey, refreshTick }: { c: BoardCopy; windowKey:
 }
 
 function TopProvidersCard({ c, windowKey, refreshTick }: { c: BoardCopy; windowKey: WindowKey; refreshTick: number }) {
+  const { user } = useMarketAuth();
   const [data, setData] = useState<ProviderRow[] | null>(null);
   const [loading, setLoading] = useState(true);
   const days = windowKey === "24h" ? 1 : windowKey === "7d" ? 7 : 30;
+  const canSeeEmail = !!user?.isAdmin;
 
   useEffect(() => {
     let cancelled = false;
@@ -393,7 +402,7 @@ function TopProvidersCard({ c, windowKey, refreshTick }: { c: BoardCopy; windowK
   }, [days, refreshTick]);
 
   const columns: Column<ProviderRow>[] = [
-    { key: "ownerEmail", header: c.topProviders.colEmail, render: (r) => <span className="font-mono text-xs break-all text-slate-700">{r.ownerEmail}</span> },
+    { key: "ownerEmail", header: c.topProviders.colEmail, render: (r) => <span className="font-mono text-xs break-all text-slate-700">{displayBoardEmail(r.ownerEmail, canSeeEmail)}</span> },
     { key: "grossSpendUsd", header: c.topProviders.colSpend, render: (r) => <span className="font-mono font-extrabold">{formatMoneyFull(r.grossSpendUsd)}</span> },
     { key: "requests", header: c.topProviders.colRequests, render: (r) => <span className="font-mono">{formatInt(r.requests)}</span> },
     { key: "uniqueShares", header: c.topProviders.colShares, render: (r) => <span className="font-mono">{formatInt(r.uniqueShares)}</span> },
@@ -401,7 +410,7 @@ function TopProvidersCard({ c, windowKey, refreshTick }: { c: BoardCopy; windowK
   return (
     <div className="sticker bg-white p-5 md:p-6">
       <h2 className="font-display text-xl font-extrabold flex items-center gap-2"><Layers size={18} /> {c.topProviders.title}</h2>
-      <p className="mt-0.5 text-xs text-slate-500">{c.topProviders.subtitle} · {c.windows[windowKey]}</p>
+      <p className="mt-0.5 text-xs text-slate-500">{c.windows[windowKey]} · top {TOP_LIMIT}</p>
       <div className="mt-3">
         <DataTable
           rows={data ?? []}
@@ -416,9 +425,11 @@ function TopProvidersCard({ c, windowKey, refreshTick }: { c: BoardCopy; windowK
 }
 
 function TopUsersCard({ c, windowKey, refreshTick }: { c: BoardCopy; windowKey: WindowKey; refreshTick: number }) {
+  const { user } = useMarketAuth();
   const [data, setData] = useState<UserRow[] | null>(null);
   const [loading, setLoading] = useState(true);
   const days = windowKey === "24h" ? 1 : windowKey === "7d" ? 7 : 30;
+  const canSeeEmail = !!user?.isAdmin;
 
   useEffect(() => {
     let cancelled = false;
@@ -431,14 +442,14 @@ function TopUsersCard({ c, windowKey, refreshTick }: { c: BoardCopy; windowKey: 
   }, [days, refreshTick]);
 
   const columns: Column<UserRow>[] = [
-    { key: "email", header: c.topUsers.colEmail, render: (r) => <span className="font-mono text-xs break-all text-slate-700">{r.email}</span> },
+    { key: "email", header: c.topUsers.colEmail, render: (r) => <span className="font-mono text-xs break-all text-slate-700">{displayBoardEmail(r.email, canSeeEmail)}</span> },
     { key: "spendUsd", header: c.topUsers.colSpend, render: (r) => <span className="font-mono font-extrabold">{formatMoneyFull(r.spendUsd)}</span> },
     { key: "requests", header: c.topUsers.colRequests, render: (r) => <span className="font-mono">{formatInt(r.requests)}</span> },
   ];
   return (
     <div className="sticker bg-white p-5 md:p-6">
       <h2 className="font-display text-xl font-extrabold flex items-center gap-2"><Users size={18} /> {c.topUsers.title}</h2>
-      <p className="mt-0.5 text-xs text-slate-500">{c.topUsers.subtitle} · {c.windows[windowKey]}</p>
+      <p className="mt-0.5 text-xs text-slate-500">{c.windows[windowKey]} · top {TOP_LIMIT}</p>
       <div className="mt-3">
         <DataTable
           rows={data ?? []}
@@ -452,23 +463,27 @@ function TopUsersCard({ c, windowKey, refreshTick }: { c: BoardCopy; windowKey: 
   );
 }
 
-function SelfServiceCard({ c }: { c: BoardCopy }) {
-  return (
-    <div className="relative overflow-hidden sticker bg-amber-200 p-8 md:p-10">
-      <span aria-hidden className="pointer-events-none absolute -right-12 -top-12 h-44 w-44 rounded-full bg-amber-300/70" />
-      <span aria-hidden className="pointer-events-none absolute bottom-6 left-6 h-16 w-16 rotate-12 rounded-3xl border-2 border-slate-800 bg-violet-300" />
-      <div className="relative z-10 max-w-2xl">
-        <h2 className="font-display text-3xl font-extrabold md:text-4xl">{c.selfService.title}</h2>
-        <p className="mt-3 text-base text-slate-800">{c.selfService.body}</p>
-        <div className="mt-6 flex flex-wrap gap-3">
-          <Link href="/dashboard" className="inline-flex items-center gap-2 rounded-full border-2 border-slate-800 bg-violet-500 px-5 py-2.5 font-bold text-white btn-pop">
-            {c.selfService.cta} <ArrowRight size={16} />
-          </Link>
-          <Link href="/claim" className="inline-flex items-center gap-2 rounded-full border-2 border-slate-800 bg-white px-5 py-2.5 font-bold text-slate-900 btn-pop">
-            {c.selfService.ctaProvider}
-          </Link>
-        </div>
-      </div>
-    </div>
-  );
+function displayBoardEmail(email: string, canSeeRaw: boolean): string {
+  if (canSeeRaw) return email || "-";
+  return maskBoardEmail(email);
+}
+
+function maskBoardEmail(email: string): string {
+  const value = String(email || "").trim();
+  if (!value) return "-";
+  const [local, domain] = value.split("@");
+  if (!local || !domain) return maskPlainText(value);
+  const domainParts = domain.split(".");
+  const suffix = domainParts.length > 1 ? domainParts.slice(-1)[0] : "";
+  const domainHead = domainParts[0] || "";
+  const maskedDomain = suffix
+    ? `${maskPlainText(domainHead)}.${suffix}`
+    : maskPlainText(domain);
+  return `${maskPlainText(local)}@${maskedDomain}`;
+}
+
+function maskPlainText(value: string): string {
+  if (value.length <= 1) return "*";
+  if (value.length <= 3) return `${value[0]}***`;
+  return `${value.slice(0, 2)}***${value.slice(-1)}`;
 }

@@ -52,7 +52,9 @@ pub async fn usage(
     Query(query): Query<UsageQuery>,
 ) -> Result<Json<crate::pagination::Page<serde_json::Value>>, ApiError> {
     let mut sql = r#"
-        SELECT rc.id, rc.request_id, rc.app_type, rc.model, rc.status,
+        SELECT rc.id, rc.request_id, rc.app_type, rc.model,
+               rc.request_agent, rc.requested_model, rc.actual_model, rc.actual_model_source,
+               rc.pricing_model, rc.pricing_model_source, rc.status,
                rc.router_id, rc.share_id, rc.owner_email, rc.routing_rule_id,
                rs.raw_json AS share_raw_json,
                rc.reserved_amount, rc.usage_amount, rc.price_snapshot, rc.usage_json, rc.audit_flags,
@@ -742,9 +744,10 @@ async fn reserve_request(
         r#"
         INSERT INTO request_charges
           (id, request_id, user_id, api_key_id, router_id, share_id, owner_email, model_id, routing_rule_id, app_type, model,
+           request_agent, requested_model, actual_model, actual_model_source,
            pricing_model, pricing_slot, pricing_model_source, share_official, status,
            idempotency_key, request_body_hash, reserved_amount, price_snapshot, request_object_key, request_object_sha256, created_at)
-        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,'reserved',?16,?17,?18,?19,?20,?21,?22)
+        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,'reserved',?20,?21,?22,?23,?24,?25,?26)
         "#,
         vec![
             crate::db::uuid_val(charge_id),
@@ -758,6 +761,10 @@ async fn reserve_request(
             crate::db::opt_uuid_val(share.routing_rule_id),
             crate::db::val(app_type),
             crate::db::val(model),
+            crate::db::val(share_capability(app_type)),
+            crate::db::val(model),
+            crate::db::val(&share.pricing_model),
+            crate::db::val(&share.pricing_model_source),
             crate::db::val(&share.pricing_model),
             crate::db::val(&share.pricing_slot),
             crate::db::val(&share.pricing_model_source),
@@ -2288,6 +2295,7 @@ async fn select_share_candidates(
             capability,
             &pricing_slot,
             &pricing_model,
+            &price.app_type,
             price.model_id,
         ) {
             continue;
@@ -2407,11 +2415,29 @@ fn api_key_allows_model_access(
     capability: &str,
     slot: &str,
     pricing_model: &str,
+    pricing_vendor: &str,
     model_id: Option<Uuid>,
 ) -> bool {
+    let vendor = normalize_model_vendor(pricing_vendor);
     let Some(scope) = &api.scope_json else {
-        return true;
+        return default_agent_model_vendors(capability).contains(&vendor);
     };
+    if let Some(agent_model_vendors) = scope
+        .get("agent_model_vendors")
+        .or_else(|| scope.get("agentModelVendors"))
+    {
+        let Some(vendors) = agent_model_vendors
+            .get(capability)
+            .and_then(|value| value.as_array())
+        else {
+            return false;
+        };
+        return vendors
+            .iter()
+            .filter_map(|value| value.as_str())
+            .map(normalize_model_vendor)
+            .any(|allowed| allowed == vendor);
+    }
     if let Some(model_access) = scope
         .get("model_access")
         .or_else(|| scope.get("modelAccess"))
@@ -2437,7 +2463,26 @@ fn api_key_allows_model_access(
             .filter_map(|value| value.as_str())
             .any(|allowed| allowed == model_id);
     }
-    true
+    default_agent_model_vendors(capability).contains(&vendor)
+}
+
+fn normalize_model_vendor(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "anthropic" | "claude" => "anthropic".to_string(),
+        "openai" | "codex" => "openai".to_string(),
+        "google" | "gemini" => "gemini".to_string(),
+        "deepseek" => "deepseek".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn default_agent_model_vendors(capability: &str) -> Vec<String> {
+    match capability {
+        "claude" => vec!["anthropic".to_string()],
+        "codex" => vec!["openai".to_string()],
+        "gemini" => vec!["gemini".to_string()],
+        _ => Vec::new(),
+    }
 }
 
 async fn order_share_candidates(
@@ -2685,6 +2730,10 @@ fn charge_json(row: crate::db::DbRow) -> serde_json::Value {
         "request_id": row.string("request_id"),
         "app_type": row.string("app_type"),
         "model": row.string("model"),
+        "request_agent": row.opt_string("request_agent").unwrap_or_else(|| share_capability(&row.string("app_type")).to_string()),
+        "requested_model": row.opt_string("requested_model").unwrap_or_else(|| row.string("model")),
+        "actual_model": row.opt_string("actual_model").or_else(|| row.opt_string("pricing_model")).unwrap_or_else(|| row.string("model")),
+        "actual_model_source": row.opt_string("actual_model_source").or_else(|| row.opt_string("pricing_model_source")).unwrap_or_else(|| "official".to_string()),
         "router_id": row.string("router_id"),
         "share_id": row.string("share_id"),
         "share_subdomain": share_subdomain(row.opt_string("share_raw_json").as_deref()),
@@ -2773,13 +2822,15 @@ fn subdomain_from_url(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        SelectedShare, commission_amount, commission_split, inject_openai_stream_usage,
-        is_allowed_router_market_proxy_header, looks_like_sse, parse_gemini_model_action,
-        parse_non_stream_sse_fallback, rendezvous_share_score, share_subdomain, share_weight,
+        SelectedShare, api_key_allows_model_access, commission_amount, commission_split,
+        inject_openai_stream_usage, is_allowed_router_market_proxy_header, looks_like_sse,
+        parse_gemini_model_action, parse_non_stream_sse_fallback, rendezvous_share_score,
+        share_subdomain, share_weight,
     };
-    use crate::usage::UsageProtocol;
+    use crate::{auth::ApiKeyPrincipal, pricing, usage::UsageProtocol};
     use rust_decimal::Decimal;
     use serde_json::json;
+    use uuid::Uuid;
 
     #[test]
     fn inject_openai_stream_usage_sets_include_usage() {
@@ -2923,6 +2974,7 @@ mod tests {
                 official_output_per_million: None,
                 official_cache_read_per_million: None,
                 official_cache_write_per_million: None,
+                discount_percent: Decimal::TEN,
                 currency: "USD".to_string(),
                 status: "active".to_string(),
             },
@@ -2937,6 +2989,74 @@ mod tests {
             rendezvous_share_score("user-1:model", &share_a)
         );
         assert!(share_weight(&share_a) > share_weight(&busy_share));
+    }
+
+    #[test]
+    fn api_key_vendor_scope_defaults_by_agent() {
+        let api = ApiKeyPrincipal {
+            user_id: Uuid::nil(),
+            api_key_id: Uuid::nil(),
+            monthly_spend_cap: None,
+            scope_json: None,
+        };
+
+        assert!(api_key_allows_model_access(
+            &api,
+            "claude",
+            "sonnet",
+            "claude-sonnet-4-6",
+            "anthropic",
+            Some(Uuid::nil()),
+        ));
+        assert!(!api_key_allows_model_access(
+            &api,
+            "claude",
+            "sonnet",
+            "gpt-5.5",
+            "openai",
+            Some(Uuid::nil()),
+        ));
+        assert!(api_key_allows_model_access(
+            &api,
+            "codex",
+            "model",
+            "gpt-5.5",
+            "openai",
+            Some(Uuid::nil()),
+        ));
+    }
+
+    #[test]
+    fn api_key_vendor_scope_allows_agent_specific_vendor() {
+        let api = ApiKeyPrincipal {
+            user_id: Uuid::nil(),
+            api_key_id: Uuid::nil(),
+            monthly_spend_cap: None,
+            scope_json: Some(json!({
+                "agent_model_vendors": {
+                    "claude": ["anthropic", "openai"],
+                    "codex": ["openai"],
+                    "gemini": ["gemini"]
+                }
+            })),
+        };
+
+        assert!(api_key_allows_model_access(
+            &api,
+            "claude",
+            "sonnet",
+            "gpt-5.5",
+            "openai",
+            Some(Uuid::nil()),
+        ));
+        assert!(!api_key_allows_model_access(
+            &api,
+            "codex",
+            "model",
+            "claude-sonnet-4-6",
+            "anthropic",
+            Some(Uuid::nil()),
+        ));
     }
 
     #[test]

@@ -67,7 +67,7 @@ API 用户
 当前实现说明：
 
 - Dodo webhook 使用 Standard Webhooks 风格的 `webhook-id`、`webhook-timestamp`、`webhook-signature` 校验，并用 webhook id 做幂等。
-- Gate.io 自动提现启用后调用 API V4 `POST /api/v4/withdrawals/push`，请求/响应原文写入对象存储，未知或失败状态进入人工复核。
+- Gate.io 自动提现启用后调用 API V4 `POST /api/v4/withdrawals/push`，只支持纯数字 Gate.io 用户 UID（`receive_uid`），不支持邮箱或手机；请求/响应原文写入对象存储，未知或失败状态进入人工复核。
 - OpenAI `/v1/chat/completions` 支持 `stream=true`，market 会强制注入 `stream_options.include_usage=true`，边转发 SSE 边解析 usage；无 usage、上游中断或客户端断开会进入 `needs_review`，由 admin 在 `/admin/charges` 手动结算或释放。
 - Anthropic `/v1/messages` streaming 暂不开放，继续显式拒绝，避免在未完成 provider-specific usage tee 前出现资金风险。
 
@@ -169,24 +169,24 @@ $HOME/.config/cc-switch-market/.env
 | --- | --- | --- |
 | `MARKET_HTTP_ADDR` | `0.0.0.0:8080` | market 本地 HTTP 监听地址。只影响进程绑定哪个 IP/端口，不代表公网访问地址。 |
 | `MARKET_TUNNEL_ENABLED` | `true` | 是否在启动后自动向 router 申请 market tunnel lease，并把 `ROUTER_MARKET_SUBDOMAIN.ROUTER_BASE_DOMAIN` 转发到本地 `MARKET_HTTP_ADDR`。本地仅调试 HTTP 服务时可设为 `false`。 |
-| `RUST_LOG` | `cc_switch_market=debug,tower_http=info,axum=info` | Rust 日志过滤规则。生产环境可改为 `cc_switch_market=info,tower_http=warn,axum=warn`。 |
+| `RUST_LOG` | `cc_switch_market=info,tower_http=info,axum=info` | Rust 日志过滤规则。生产环境可改为 `cc_switch_market=info,tower_http=warn,axum=warn`。 |
 | `MARKET_SESSION_COOKIE_NAME` | `cc_switch_market_session` | market Web 登录使用的 HttpOnly session cookie 名称。 |
 | `MARKET_SESSION_COOKIE_SECRET` | `change-me-market-session-secret-32b` | market Web session token hash pepper。生产环境必须改成高强度随机值。 |
 | `MARKET_SESSION_TTL_SECS` | `2592000` | market Web session 有效期，默认 30 天。 |
 | `MARKET_ADMIN_EMAILS` | `admin@example.com` | market 管理员邮箱白名单，多个邮箱用英文逗号分隔。后端根据已验证 session email 判定 admin。 |
-| `MARKET_MIN_REQUEST_BALANCE` | `1.00` | API 请求进入 router 前要求用户至少具备的余额门槛；实际扣费仍按 market 解析到的 usage 和价格快照结算。 |
+| `MARKET_MIN_REQUEST_BALANCE` | `0.10` | API 请求进入 router 前要求用户至少具备的余额门槛；实际扣费仍按 market 解析到的 usage 和价格快照结算。 |
 | `MARKET_PLATFORM_COMMISSION_BPS` | `1000` | token 用量消费的 Market 抽成比例，单位为 basis points；默认 1000 即 10%。 |
 | `MARKET_ROUTER_COMMISSION_BPS` | `500` | token 用量消费的 Router 抽成比例，单位为 basis points；默认 500 即 5%。Market + Router 总抽成不能超过 10000。Router 抽成进入 `router@[router_host]` 的 provider 余额。 |
-| `MARKET_SQLITE_PATH` | 空 | 本地 SQLite 数据库路径。为空时使用 `$HOME/.config/cc-switch-market/cc-switch-market.db`。仅在未配置 `TURSO_DATABASE_URL` 时生效。 |
+| `MARKET_SQLITE_PATH` | `$HOME/.config/cc-switch-market/cc-switch-market.db` | 本地 SQLite 数据库路径。仅在未配置 `TURSO_DATABASE_URL` 时生效。 |
 | `TURSO_DATABASE_URL` | 空 | Turso 远程数据库 URL，必须以 `libsql://` 开头。为空时使用本地 SQLite。只要配置了 Turso，连接失败就直接启动失败，不会回退到本地 SQLite。 |
 | `TURSO_AUTH_TOKEN` | 空 | Turso 认证 token。配置 `TURSO_DATABASE_URL` 时必填。 |
-| `TURSO_REPLICA_PATH` | 空 | Turso embedded replica 本地路径。为空时使用 `$HOME/.config/cc-switch-market/turso-replica.db`。 |
+| `TURSO_REPLICA_PATH` | `$HOME/.config/cc-switch-market/turso-replica.db` | Turso embedded replica 本地路径。 |
 | `TURSO_SYNC_INTERVAL_SECS` | `300` | Turso replica 同步间隔预留配置。 |
 | `TURSO_BACKUP_ENABLED` | `true` | 使用 Turso 时是否定时把本地 replica 复制到备份目录。 |
 | `TURSO_BACKUP_INTERVAL_SECS` | `3600` | Turso 本地备份间隔，默认每小时。 |
 | `TURSO_BACKUP_RETENTION_DAYS` | `7` | Turso 本地备份保留天数，默认只保留最近 1 周。 |
 | `OBJECT_STORE_BACKEND` | `local` | 对象存储后端。当前 binary 支持 `local`；`r2` 为生产扩展预留，配置后会 fail-fast。 |
-| `OBJECT_STORE_LOCAL_DIR` | 空 | 本地对象存储目录。为空时使用 `$HOME/.config/cc-switch-market/objects`。 |
+| `OBJECT_STORE_LOCAL_DIR` | `$HOME/.config/cc-switch-market/objects` | 本地对象存储目录。 |
 | `R2_ACCOUNT_ID` | 空 | Cloudflare R2 account id，当前预留未启用。 |
 | `R2_ACCESS_KEY_ID` | 空 | Cloudflare R2 access key id，当前预留未启用。 |
 | `R2_SECRET_ACCESS_KEY` | 空 | Cloudflare R2 secret access key，当前预留未启用。 |
@@ -204,7 +204,7 @@ $HOME/.config/cc-switch-market/.env
 | `GATEIO_API_BASE` | `https://api.gateio.ws` | Gate.io API 基础地址。通常保持默认。 |
 | `GATEIO_API_KEY` | 空 | Gate.io API key。仅启用自动提现时需要。 |
 | `GATEIO_API_SECRET` | 空 | Gate.io API secret。仅启用自动提现时需要，必须妥善保护。 |
-| `GATEIO_SETTLEMENT_CURRENCY` | `USDT` | provider 自动提现使用的 Gate.io 结算币种。 |
+| `GATEIO_SETTLEMENT_CURRENCY` | `USDT` | provider 自动提现使用的 Gate.io 结算币种；自动提现目标必须填写纯数字 Gate.io 用户 UID。 |
 | `GATEIO_USD_USDT_RATE` | `1.000000` | USD 到 USDT 的结算换算率。MVP 默认按 1:1。 |
 | `GATEIO_AUTO_PAYOUT_ENABLED` | `false` | 是否启用 Gate.io 自动提现。为 `false` 时提现走人工工单/手动处理路径。 |
 | `GATEIO_PAYOUT_WORKER_INTERVAL_SECS` | `60` | Gate.io 自动提现 worker 扫描 pending payout 的间隔。 |

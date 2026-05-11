@@ -75,6 +75,7 @@ pub async fn connect(config: &Config) -> anyhow::Result<Db> {
 pub async fn migrate(db: &Db) -> anyhow::Result<()> {
     db.execute_batch(SCHEMA).await?;
     additive_migrations(db).await?;
+    migrate_model_prices_to_official(db).await?;
     seed_defaults(db).await?;
     backfill_model_price_models(db).await?;
     Ok(())
@@ -116,6 +117,10 @@ async fn additive_migrations(db: &Db) -> anyhow::Result<()> {
         "ALTER TABLE request_charges ADD COLUMN pricing_slot TEXT",
         "ALTER TABLE request_charges ADD COLUMN pricing_model_source TEXT",
         "ALTER TABLE request_charges ADD COLUMN share_official INTEGER DEFAULT 0",
+        "ALTER TABLE request_charges ADD COLUMN request_agent TEXT",
+        "ALTER TABLE request_charges ADD COLUMN requested_model TEXT",
+        "ALTER TABLE request_charges ADD COLUMN actual_model TEXT",
+        "ALTER TABLE request_charges ADD COLUMN actual_model_source TEXT",
         "ALTER TABLE topup_orders ADD COLUMN payment_method_type TEXT",
     ] {
         if let Err(err) = db.execute(sql, vec![]).await {
@@ -225,8 +230,66 @@ async fn additive_migrations(db: &Db) -> anyhow::Result<()> {
           value TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS internal_migrations (
+          name TEXT PRIMARY KEY,
+          applied_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS model_vendor_discounts (
+          app_type TEXT PRIMARY KEY,
+          discount_percent TEXT NOT NULL DEFAULT '10',
+          updated_at TEXT NOT NULL
+        );
         "#
     ).await?;
+    Ok(())
+}
+
+async fn migrate_model_prices_to_official(db: &Db) -> anyhow::Result<()> {
+    let marker = "model_prices_store_official_prices_v1";
+    let already_applied = db
+        .query_optional(
+            "SELECT name FROM internal_migrations WHERE name=?1 LIMIT 1",
+            vec![val(marker)],
+        )
+        .await?
+        .is_some();
+    if !already_applied {
+        let now = now_string();
+        let rows = db
+            .query_all(
+                "SELECT id, input_per_million, output_per_million, cache_read_per_million, cache_write_per_million FROM model_prices",
+                vec![],
+            )
+            .await?;
+        for row in rows {
+            db.execute(
+                r#"
+                UPDATE model_prices
+                   SET input_per_million = ?2,
+                       output_per_million = ?3,
+                       cache_read_per_million = ?4,
+                       cache_write_per_million = ?5,
+                       updated_at = ?6
+                 WHERE id = ?1
+                "#,
+                vec![
+                    val(row.string("id")),
+                    dec_val(row.decimal("input_per_million") * Decimal::TEN),
+                    dec_val(row.decimal("output_per_million") * Decimal::TEN),
+                    dec_val(row.decimal("cache_read_per_million") * Decimal::TEN),
+                    dec_val(row.decimal("cache_write_per_million") * Decimal::TEN),
+                    val(&now),
+                ],
+            )
+            .await?;
+        }
+        db.execute(
+            "INSERT INTO internal_migrations (name, applied_at) VALUES (?1, ?2)",
+            vec![val(marker), val(&now)],
+        )
+        .await?;
+    }
+    ensure_model_vendor_discounts(db).await?;
     Ok(())
 }
 
@@ -598,6 +661,10 @@ async fn seed_defaults(db: &Db) -> anyhow::Result<()> {
     for price in default_model_prices() {
         let now = now_string();
         let model_id = ensure_model_row(db, price.app_type, price.model_pattern, None).await?;
+        let input = default_official_price(price.input);
+        let output = default_official_price(price.output);
+        let cache_read = default_official_price(price.cache_read);
+        let cache_write = default_official_price(price.cache_write);
         let existing = db
             .query_optional(
                 "SELECT id FROM model_prices WHERE app_type = ?1 AND model_pattern = ?2 AND status = 'active' LIMIT 1",
@@ -617,10 +684,10 @@ async fn seed_defaults(db: &Db) -> anyhow::Result<()> {
                  WHERE id = ?7
                 "#,
                 vec![
-                    val(price.input),
-                    val(price.output),
-                    val(price.cache_read),
-                    val(price.cache_write),
+                    dec_val(input),
+                    dec_val(output),
+                    dec_val(cache_read),
+                    dec_val(cache_write),
                     uuid_val(model_id),
                     val(&now),
                     val(row.string("id")),
@@ -640,19 +707,43 @@ async fn seed_defaults(db: &Db) -> anyhow::Result<()> {
                 uuid_val(model_id),
                 val(price.app_type),
                 val(price.model_pattern),
-                val(price.input),
-                val(price.output),
-                val(price.cache_read),
-                val(price.cache_write),
+                dec_val(input),
+                dec_val(output),
+                dec_val(cache_read),
+                dec_val(cache_write),
                 val(&now),
             ],
         )
         .await?;
     }
+    ensure_model_vendor_discounts(db).await?;
+    let now = now_string();
+    db.execute(
+        r#"
+        UPDATE model_prices
+           SET status = 'inactive', updated_at = ?1
+         WHERE app_type = 'deepseek'
+           AND model_pattern NOT IN ('deepseek-v4-pro*', 'deepseek-v4-flash*')
+           AND status = 'active'
+        "#,
+        vec![val(&now)],
+    )
+    .await?;
+    db.execute(
+        r#"
+        UPDATE models
+           SET status = 'inactive', updated_at = ?1
+         WHERE app_type = 'deepseek'
+           AND model_pattern NOT IN ('deepseek-v4-pro*', 'deepseek-v4-flash*')
+           AND status = 'active'
+        "#,
+        vec![val(&now)],
+    )
+    .await?;
     for (fee_type, method, fixed, bps) in [
         ("topup", "dodo", "0.30000000", 290_i32),
-        ("payout", "gateio", "0.20000000", 0_i32),
-        ("payout", "manual", "0.50000000", 0_i32),
+        ("payout", "gateio", "0.00000000", 0_i32),
+        ("payout", "manual", "0.00000000", 0_i32),
     ] {
         db.execute(
             r#"
@@ -674,6 +765,33 @@ async fn seed_defaults(db: &Db) -> anyhow::Result<()> {
         .await?;
     }
     Ok(())
+}
+
+async fn ensure_model_vendor_discounts(db: &Db) -> anyhow::Result<()> {
+    let now = now_string();
+    db.execute(
+        r#"
+        INSERT INTO model_vendor_discounts (app_type, discount_percent, updated_at)
+        SELECT DISTINCT app_type, '10', ?1 FROM models WHERE app_type IS NOT NULL AND app_type <> ''
+        ON CONFLICT(app_type) DO NOTHING
+        "#,
+        vec![val(&now)],
+    )
+    .await?;
+    db.execute(
+        r#"
+        INSERT INTO model_vendor_discounts (app_type, discount_percent, updated_at)
+        SELECT DISTINCT app_type, '10', ?1 FROM model_prices WHERE app_type IS NOT NULL AND app_type <> ''
+        ON CONFLICT(app_type) DO NOTHING
+        "#,
+        vec![val(&now)],
+    )
+    .await?;
+    Ok(())
+}
+
+fn default_official_price(value: &str) -> Decimal {
+    Decimal::from_str(value).unwrap_or(Decimal::ZERO) * Decimal::TEN
 }
 
 async fn ensure_model_row(
@@ -769,7 +887,7 @@ pub(crate) struct DefaultModelPrice {
 
 pub(crate) fn default_model_prices() -> &'static [DefaultModelPrice] {
     // Default TokenMarket prices are public list prices divided by 10.
-    // Reviewed against official OpenAI, Anthropic, and Gemini pricing pages on 2026-05-06.
+    // Reviewed against official OpenAI, Anthropic, Gemini, and DeepSeek pricing pages on 2026-05-10.
     &[
         DefaultModelPrice {
             app_type: "openai",
@@ -801,6 +919,22 @@ pub(crate) fn default_model_prices() -> &'static [DefaultModelPrice] {
             input: "0.25000000",
             output: "1.50000000",
             cache_read: "0.02500000",
+            cache_write: "0.00000000",
+        },
+        DefaultModelPrice {
+            app_type: "deepseek",
+            model_pattern: "deepseek-v4-pro*",
+            input: "0.04350000",
+            output: "0.08700000",
+            cache_read: "0.00000000",
+            cache_write: "0.00000000",
+        },
+        DefaultModelPrice {
+            app_type: "deepseek",
+            model_pattern: "deepseek-v4-flash*",
+            input: "0.01400000",
+            output: "0.02800000",
+            cache_read: "0.00000000",
             cache_write: "0.00000000",
         },
         DefaultModelPrice {
@@ -982,6 +1116,47 @@ pub(crate) fn default_model_prices() -> &'static [DefaultModelPrice] {
     ]
 }
 
+#[cfg(test)]
+mod tests {
+    use super::default_model_prices;
+
+    #[test]
+    fn default_prices_include_deepseek_vendor_models() {
+        let prices = default_model_prices();
+        let deepseek_prices = prices
+            .iter()
+            .filter(|price| price.app_type == "deepseek")
+            .collect::<Vec<_>>();
+        let find = |pattern: &str| {
+            deepseek_prices
+                .iter()
+                .copied()
+                .find(|price| price.app_type == "deepseek" && price.model_pattern == pattern)
+                .expect("deepseek price")
+        };
+
+        let flash = find("deepseek-v4-flash*");
+        assert_eq!(flash.input, "0.01400000");
+        assert_eq!(flash.output, "0.02800000");
+        assert_eq!(flash.cache_read, "0.00000000");
+        assert_eq!(flash.cache_write, "0.00000000");
+
+        let pro = find("deepseek-v4-pro*");
+        assert_eq!(pro.input, "0.04350000");
+        assert_eq!(pro.output, "0.08700000");
+        assert_eq!(pro.cache_read, "0.00000000");
+        assert_eq!(pro.cache_write, "0.00000000");
+
+        assert_eq!(
+            deepseek_prices
+                .iter()
+                .map(|price| price.model_pattern)
+                .collect::<Vec<_>>(),
+            vec!["deepseek-v4-pro*", "deepseek-v4-flash*"]
+        );
+    }
+}
+
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
 
@@ -1118,6 +1293,17 @@ CREATE TABLE IF NOT EXISTS model_prices (
   status TEXT NOT NULL,
   effective_from TEXT NOT NULL,
   created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS internal_migrations (
+  name TEXT PRIMARY KEY,
+  applied_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS model_vendor_discounts (
+  app_type TEXT PRIMARY KEY,
+  discount_percent TEXT NOT NULL DEFAULT '10',
   updated_at TEXT NOT NULL
 );
 
@@ -1318,6 +1504,10 @@ CREATE TABLE IF NOT EXISTS request_charges (
   routing_rule_id TEXT,
   app_type TEXT NOT NULL,
   model TEXT NOT NULL,
+  request_agent TEXT,
+  requested_model TEXT,
+  actual_model TEXT,
+  actual_model_source TEXT,
   pricing_model TEXT,
   pricing_slot TEXT,
   pricing_model_source TEXT,

@@ -37,7 +37,7 @@ const FIELDS: &[Field] = &[
     Field {
         key: "RUST_LOG",
         prompt: "Rust log filter",
-        default: "cc_switch_market=debug,tower_http=info,axum=info",
+        default: "cc_switch_market=info,tower_http=info,axum=info",
         kind: FieldKind::Text,
         required: false,
     },
@@ -72,7 +72,7 @@ const FIELDS: &[Field] = &[
     Field {
         key: "MARKET_MIN_REQUEST_BALANCE",
         prompt: "Minimum user balance required before proxying a request",
-        default: "1.00",
+        default: "0.10",
         kind: FieldKind::Text,
         required: true,
     },
@@ -92,8 +92,8 @@ const FIELDS: &[Field] = &[
     },
     Field {
         key: "MARKET_SQLITE_PATH",
-        prompt: "Local SQLite path, empty uses default config dir",
-        default: "",
+        prompt: "Local SQLite path",
+        default: "$HOME/.config/cc-switch-market/cc-switch-market.db",
         kind: FieldKind::Text,
         required: false,
     },
@@ -113,8 +113,8 @@ const FIELDS: &[Field] = &[
     },
     Field {
         key: "TURSO_REPLICA_PATH",
-        prompt: "Turso embedded replica path, empty uses default config dir",
-        default: "",
+        prompt: "Turso embedded replica path",
+        default: "$HOME/.config/cc-switch-market/turso-replica.db",
         kind: FieldKind::Text,
         required: false,
     },
@@ -155,8 +155,8 @@ const FIELDS: &[Field] = &[
     },
     Field {
         key: "OBJECT_STORE_LOCAL_DIR",
-        prompt: "Local object store dir, empty uses default config dir",
-        default: "",
+        prompt: "Local object store dir",
+        default: "$HOME/.config/cc-switch-market/objects",
         kind: FieldKind::Text,
         required: false,
     },

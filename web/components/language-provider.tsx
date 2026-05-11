@@ -12,13 +12,13 @@ type LanguageContextValue = {
 const STORAGE_KEY = "cc_switch_market_locale";
 
 const LanguageContext = createContext<LanguageContextValue>({
-  locale: "zh",
+  locale: "en",
   setLocale: () => {},
-  t: messages.zh
+  t: messages.en
 });
 
 export function LanguageProvider({ children }: { children: ReactNode }) {
-  const [locale, setLocaleState] = useState<Locale>("zh");
+  const [locale, setLocaleState] = useState<Locale>("en");
 
   useEffect(() => {
     if (typeof window === "undefined") return;

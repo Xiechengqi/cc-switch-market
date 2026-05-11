@@ -35,12 +35,11 @@ pub async fn execute_transfer(
 
     let path = "/api/v4/withdrawals/push";
     let attempt_id = uuid::Uuid::new_v4();
-    let recipient = gateio_recipient(&target)?;
+    let receive_uid = gateio_receive_uid(&target)?;
     let body = serde_json::json!({
+        "receive_uid": receive_uid,
         "currency": state.config.gateio_settlement_currency,
         "amount": amount.to_string(),
-        "text": payout_id.to_string(),
-        "receiver": recipient,
     });
     let body_string = body.to_string();
     let timestamp = chrono::Utc::now().timestamp().to_string();
@@ -157,33 +156,25 @@ pub async fn self_check(state: &AppState) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn gateio_recipient(target: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
-    let email = target
-        .get("email")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let uid = target
-        .get("uid")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    match (email, uid) {
-        (Some(email), _) => Ok(serde_json::json!({ "type": "email", "value": email })),
-        (None, Some(uid)) => Ok(serde_json::json!({ "type": "uid", "value": uid })),
-        _ => Err(ApiError::bad_request(
-            "missing_gateio_target",
-            "Gate.io email or uid is required",
-        )),
-    }
+fn gateio_receive_uid(target: &serde_json::Value) -> Result<u64, ApiError> {
+    let uid = match target.get("uid") {
+        Some(value) if value.is_u64() => value.as_u64(),
+        Some(value) if value.is_string() => value
+            .as_str()
+            .and_then(|value| value.trim().parse::<u64>().ok()),
+        _ => None,
+    };
+    let Some(uid) = uid.filter(|uid| *uid > 0) else {
+        return Err(ApiError::bad_request(
+            "missing_gateio_uid",
+            "Gate.io user UID is required for automatic payout",
+        ));
+    };
+    Ok(uid)
 }
 
 fn mask_gateio_body(body: &serde_json::Value) -> serde_json::Value {
-    let mut body = body.clone();
-    if let Some(receiver) = body.get_mut("receiver") {
-        *receiver = serde_json::json!({"masked": true});
-    }
-    body
+    body.clone()
 }
 
 fn external_tx_id(value: &serde_json::Value) -> Option<String> {

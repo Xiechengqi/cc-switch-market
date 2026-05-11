@@ -1,0 +1,123 @@
+name: Build and Release
+
+on:
+  push:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: latest-release
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Build web
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Build linux-amd64 binary
+        run: cargo build --release --locked
+        env:
+          CC_SWITCH_MARKET_GIT_SHA: ${{ github.sha }}
+          CC_SWITCH_MARKET_GIT_REF: ${{ github.ref_name }}
+          CC_SWITCH_MARKET_BUILD_TIME: ${{ github.event.head_commit.timestamp }}
+
+      - name: Prepare release asset
+        run: |
+          cp target/release/cc-switch-market cc-switch-market-linux-amd64
+          chmod +x cc-switch-market-linux-amd64
+          ls -lh cc-switch-market-linux-amd64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cc-switch-market-linux-amd64
+          path: cc-switch-market-linux-amd64
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cc-switch-market-linux-amd64
+          path: release-files
+
+      - name: Get version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "version=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Current version: v${VERSION}"
+
+      - name: Delete existing latest release and tag
+        run: |
+          gh release delete latest --yes || true
+          git push origin :refs/tags/latest || true
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Create latest tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f latest
+          git push -f origin latest
+
+      - name: Create latest release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Latest Build (${{ steps.version.outputs.version }})"
+          body: |
+            ## Latest automatic build
+
+            **Version**: ${{ steps.version.outputs.version }}
+            **Commit**: ${{ github.sha }}
+            **Branch**: ${{ github.ref_name }}
+            **Build time**: ${{ github.event.head_commit.timestamp }}
+
+            ### Changes
+
+            ${{ github.event.head_commit.message }}
+
+            ### Download
+
+            - **Linux AMD64**: `cc-switch-market-linux-amd64`
+
+            ### Quick install
+
+            ```bash
+            wget https://github.com/${{ github.repository }}/releases/download/latest/cc-switch-market-linux-amd64 -O cc-switch-market
+            chmod +x cc-switch-market
+            ```
+          files: release-files/cc-switch-market-linux-amd64
+          prerelease: false
+          draft: false

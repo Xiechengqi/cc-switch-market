@@ -395,11 +395,27 @@ function ModelsTab() {
   const [items, setItems] = useState<AnyRow[] | null>(null);
   const [editorOpen, setEditorOpen] = useState(false);
   const [editTarget, setEditTarget] = useState<AnyRow | null>(null);
-  const [appTab, setAppTab] = useState("all");
+  const [appTab, setAppTab] = useState(() => {
+    if (typeof window === "undefined") return "all";
+    return window.localStorage.getItem("cc-switch-market:admin-models-vendor") || "all";
+  });
+  const [discountDraft, setDiscountDraft] = useState("10");
   function reload() { apiGet<AnyRow[]>("/v1/admin/models").then(setItems).catch(() => setItems([])); }
   useEffect(() => { reload(); }, []);
   const appTypes = Array.from(new Set((items ?? []).map((item) => String(item.app_type ?? "")).filter(Boolean))).sort();
-  const rows = appTab === "all" ? (items ?? []) : (items ?? []).filter((item) => String(item.app_type ?? "") === appTab);
+  useEffect(() => {
+    if (!items) return;
+    if (appTab !== "all" && !appTypes.includes(appTab)) setAppTab("all");
+  }, [appTab, appTypes, items]);
+  useEffect(() => {
+    if (typeof window !== "undefined") window.localStorage.setItem("cc-switch-market:admin-models-vendor", appTab);
+  }, [appTab]);
+  const activeVendorItem = appTab === "all" ? undefined : (items ?? []).find((item) => String(item.app_type ?? "") === appTab);
+  const activeVendorDiscount = String(((activeVendorItem?.price as AnyRow | undefined)?.discount_percent) ?? "10");
+  useEffect(() => {
+    setDiscountDraft(activeVendorDiscount);
+  }, [activeVendorDiscount]);
+  const rows = (appTab === "all" ? (items ?? []) : (items ?? []).filter((item) => String(item.app_type ?? "") === appTab)).slice().sort(compareModelRows);
   async function toggleStatus(row: AnyRow) {
     const id = String(row.id);
     const active = String(row.status ?? "active") === "active";
@@ -412,13 +428,28 @@ function ModelsTab() {
     }
   }
   async function deleteModel(row: AnyRow) {
-    if (!window.confirm(`确认删除模型 ${String(row.model_pattern ?? "")}？此操作只允许删除已下线模型。`)) return;
+    if (!window.confirm(`确认删除模型 ${String(row.model_pattern ?? "")}？此操作只允许删除已下线模型`)) return;
     try {
       await apiDelete(`/v1/admin/models/${String(row.id)}`);
       toast.push({ variant: "success", title: "模型已删除" });
       reload();
     } catch (err) {
       toast.push({ variant: "error", title: "删除失败", description: String(err).replace(/^Error:\s*/, "") });
+    }
+  }
+  async function saveDiscount() {
+    if (appTab === "all") return;
+    const value = Number(discountDraft);
+    if (!Number.isFinite(value) || value <= 0 || value > 100) {
+      toast.push({ variant: "error", title: "打折百分比必须大于 0 且不超过 100" });
+      return;
+    }
+    try {
+      await apiPutJson(`/v1/admin/model-vendor-discounts/${encodeURIComponent(appTab)}`, { discount_percent: discountDraft });
+      toast.push({ variant: "success", title: "厂商折扣已保存" });
+      reload();
+    } catch (err) {
+      toast.push({ variant: "error", title: "保存失败", description: String(err).replace(/^Error:\s*/, "") });
     }
   }
   return (
@@ -441,16 +472,32 @@ function ModelsTab() {
           </button>
         ))}
       </div>
+      {appTab !== "all" && (
+        <div className="flex flex-wrap items-end gap-3 rounded-lg border-2 border-slate-800 bg-white p-3">
+          <Field label={`${appTab} 打折百分比`}>
+            <input
+              value={discountDraft}
+              onChange={(e) => setDiscountDraft(e.target.value)}
+              inputMode="decimal"
+              className="w-36 rounded-2xl border-2 border-slate-800 bg-amber-50 px-3 py-2 font-mono outline-none focus:bg-white"
+            />
+          </Field>
+          <button onClick={saveDiscount} className="rounded-full border-2 border-slate-800 bg-violet-500 px-4 py-2 font-bold text-white btn-pop">保存折扣</button>
+          <div className="pb-2 text-sm font-semibold text-slate-600">表格价格 = 官方价格 × 打折百分比</div>
+        </div>
+      )}
       <AdminDataTable
         rows={rows}
         loading={items === null}
         rowKey={(r, i) => String(r.id ?? i)}
-        empty={<EmptyState shape="triangle" title="尚未配置模型" hint="新增模型并设置价格后才能允许 API 用户调用。" />}
+        empty={<EmptyState shape="triangle" title="尚未配置模型" hint="新增模型并设置价格后才能允许 API 用户调用" />}
         columns={[
           { key: "app", header: "类型", render: (r) => <span className="rounded-full bg-violet-100 border-2 border-slate-800 px-2 py-0.5 text-xs font-bold uppercase">{String(r.app_type ?? "")}</span> },
           { key: "pattern", header: "模型", render: (r) => <span className="font-mono text-sm">{String(r.model_pattern ?? "")}</span> },
-          { key: "input", header: "输入 / 1M", render: (r) => <span className="font-mono">{formatAdminPrice(nestedPrice(r, "input_per_million"))}</span> },
-          { key: "output", header: "输出 / 1M", render: (r) => <span className="font-mono">{formatAdminPrice(nestedPrice(r, "output_per_million"))}</span> },
+          { key: "input", header: "输入 / 1M", render: (r) => <ModelPriceCell row={r} priceKey="input_per_million" officialKey="official_input_per_million" /> },
+          { key: "output", header: "输出 / 1M", render: (r) => <ModelPriceCell row={r} priceKey="output_per_million" officialKey="official_output_per_million" /> },
+          { key: "cacheRead", header: "缓存/读", render: (r) => <ModelPriceCell row={r} priceKey="cache_read_per_million" officialKey="official_cache_read_per_million" /> },
+          { key: "cacheWrite", header: "缓存/写", render: (r) => <ModelPriceCell row={r} priceKey="cache_write_per_million" officialKey="official_cache_write_per_million" /> },
           { key: "status", header: "状态", render: (r) => <Pill status={String(r.status ?? "active")} /> },
           { key: "actions", header: "操作", render: (r) => (
             <div className="flex flex-wrap gap-2">
@@ -468,9 +515,39 @@ function ModelsTab() {
   );
 }
 
+function compareModelRows(a: AnyRow, b: AnyRow) {
+  const activeDelta = (String(b.status ?? "active") === "active" ? 1 : 0) - (String(a.status ?? "active") === "active" ? 1 : 0);
+  if (activeDelta !== 0) return activeDelta;
+  for (const key of ["output_per_million", "input_per_million", "cache_write_per_million", "cache_read_per_million"]) {
+    const delta = Number(nestedPrice(b, key) ?? 0) - Number(nestedPrice(a, key) ?? 0);
+    if (delta !== 0) return delta;
+  }
+  return String(a.model_pattern ?? "").localeCompare(String(b.model_pattern ?? ""));
+}
+
+function ModelPriceCell({ row, priceKey, officialKey }: { row: AnyRow; priceKey: string; officialKey: string }) {
+  const price = row.price as AnyRow | undefined;
+  const effective = price?.[priceKey];
+  const official = price?.[officialKey];
+  const discount = price?.discount_percent ?? "10";
+  if (effective === null || effective === undefined) return <span className="text-slate-400">-</span>;
+  return (
+    <div className="grid gap-0.5">
+      <span className="font-mono">{formatAdminPrice(effective)}</span>
+      <span className="text-[11px] font-semibold text-slate-500">官方 {formatAdminPrice(official ?? effective)} × {formatCompactNumber(discount)}%</span>
+    </div>
+  );
+}
+
 function nestedPrice(row: AnyRow, key: string) {
   const price = row.price as AnyRow | undefined;
   return price?.[key] ?? "0";
+}
+
+function formatCompactNumber(value: unknown): string {
+  const amount = Number(value ?? 0);
+  if (!Number.isFinite(amount)) return "0";
+  return amount.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
 }
 
 function formatAdminUsd(value: unknown): string {
@@ -496,13 +573,13 @@ function ModelEditorModal({ open, target, onClose, onDone }: { open: boolean; ta
     id: "", app_type: "openai", model_pattern: "*",
     input_per_million: "0", output_per_million: "0",
     cache_read_per_million: "0", cache_write_per_million: "0",
-    status: "active", sort_order: "0", display_name: "", reason: ""
+    status: "active", sort_order: "0", display_name: ""
   });
   useEffect(() => {
     if (open) {
       apiGet<AnyRow[]>("/v1/admin/models")
         .then((rows) => setKnownApps(Array.from(new Set(rows.map((row) => String(row.app_type ?? "")).filter(Boolean))).sort()))
-        .catch(() => setKnownApps(["anthropic", "gemini", "openai"]));
+        .catch(() => setKnownApps(["anthropic", "deepseek", "gemini", "openai"]));
     }
     if (target) {
       const price = target.price as AnyRow | undefined;
@@ -511,22 +588,20 @@ function ModelEditorModal({ open, target, onClose, onDone }: { open: boolean; ta
         app_type: String(target.app_type ?? "openai"),
         model_pattern: String(target.model_pattern ?? "*"),
         display_name: String(target.display_name ?? ""),
-        input_per_million: String(price?.input_per_million ?? "0"),
-        output_per_million: String(price?.output_per_million ?? "0"),
-        cache_read_per_million: String(price?.cache_read_per_million ?? "0"),
-        cache_write_per_million: String(price?.cache_write_per_million ?? "0"),
+        input_per_million: String(price?.official_input_per_million ?? price?.input_per_million ?? "0"),
+        output_per_million: String(price?.official_output_per_million ?? price?.output_per_million ?? "0"),
+        cache_read_per_million: String(price?.official_cache_read_per_million ?? price?.cache_read_per_million ?? "0"),
+        cache_write_per_million: String(price?.official_cache_write_per_million ?? price?.cache_write_per_million ?? "0"),
         status: String(target.status ?? "active"),
         sort_order: String(target.sort_order ?? "0"),
-        reason: ""
       });
-      setAppMode(["anthropic", "gemini", "openai"].includes(String(target.app_type ?? "")) ? "known" : "custom");
+      setAppMode(["anthropic", "deepseek", "gemini", "openai"].includes(String(target.app_type ?? "")) ? "known" : "custom");
     } else if (open) {
-      setForm({ id: "", app_type: "openai", model_pattern: "*", display_name: "", input_per_million: "0", output_per_million: "0", cache_read_per_million: "0", cache_write_per_million: "0", status: "active", sort_order: "0", reason: "" });
+      setForm({ id: "", app_type: "openai", model_pattern: "*", display_name: "", input_per_million: "0", output_per_million: "0", cache_read_per_million: "0", cache_write_per_million: "0", status: "active", sort_order: "0" });
       setAppMode("known");
     }
   }, [open, target]);
   async function submit() {
-    if (!form.reason.trim()) { toast.push({ variant: "error", title: "请填写改价原因" }); return; }
     try {
       let id = form.id;
       const metadata = {
@@ -544,15 +619,13 @@ function ModelEditorModal({ open, target, onClose, onDone }: { open: boolean; ta
           input_per_million: form.input_per_million,
           output_per_million: form.output_per_million,
           cache_read_per_million: form.cache_read_per_million,
-          cache_write_per_million: form.cache_write_per_million,
-          reason: form.reason.trim()
+          cache_write_per_million: form.cache_write_per_million
         });
         id = String(created.id);
       }
       if (id) await apiPutJson(`/v1/admin/models/${id}/price`, {
         input_per_million: form.input_per_million, output_per_million: form.output_per_million,
-        cache_read_per_million: form.cache_read_per_million, cache_write_per_million: form.cache_write_per_million,
-        reason: form.reason.trim()
+        cache_read_per_million: form.cache_read_per_million, cache_write_per_million: form.cache_write_per_million
       });
       toast.push({ variant: "success", title: "已保存模型" });
       onDone();
@@ -578,7 +651,7 @@ function ModelEditorModal({ open, target, onClose, onDone }: { open: boolean; ta
               }}
               className="w-full rounded-2xl border-2 border-slate-800 bg-white px-3 py-2 font-bold"
             >
-              {Array.from(new Set(["openai", "anthropic", "gemini", ...knownApps])).map((app) => <option key={app} value={app}>{app}</option>)}
+              {Array.from(new Set(["openai", "anthropic", "gemini", "deepseek", ...knownApps])).map((app) => <option key={app} value={app}>{app}</option>)}
               <option value="__custom">自定义...</option>
             </select>
             {appMode === "custom" && (
@@ -594,14 +667,15 @@ function ModelEditorModal({ open, target, onClose, onDone }: { open: boolean; ta
         <Field label="模型 Pattern"><input value={form.model_pattern} onChange={(e) => setForm({ ...form, model_pattern: e.target.value })} className="w-full rounded-2xl border-2 border-slate-800 bg-amber-50 px-3 py-2 font-mono outline-none focus:bg-white" /></Field>
         <Field label="展示名"><input value={form.display_name} onChange={(e) => setForm({ ...form, display_name: e.target.value })} className="w-full rounded-2xl border-2 border-slate-800 bg-amber-50 px-3 py-2 outline-none focus:bg-white" /></Field>
         <Field label="排序"><input value={form.sort_order} onChange={(e) => setForm({ ...form, sort_order: e.target.value })} className="w-full rounded-2xl border-2 border-slate-800 bg-amber-50 px-3 py-2 font-mono outline-none focus:bg-white" /></Field>
-        <Field label="输入 / 1M"><input value={form.input_per_million} onChange={(e) => setForm({ ...form, input_per_million: e.target.value })} className="w-full rounded-2xl border-2 border-slate-800 bg-amber-50 px-3 py-2 font-mono outline-none focus:bg-white" /></Field>
-        <Field label="输出 / 1M"><input value={form.output_per_million} onChange={(e) => setForm({ ...form, output_per_million: e.target.value })} className="w-full rounded-2xl border-2 border-slate-800 bg-amber-50 px-3 py-2 font-mono outline-none focus:bg-white" /></Field>
-        <Field label="缓存读 / 1M"><input value={form.cache_read_per_million} onChange={(e) => setForm({ ...form, cache_read_per_million: e.target.value })} className="w-full rounded-2xl border-2 border-slate-800 bg-amber-50 px-3 py-2 font-mono outline-none focus:bg-white" /></Field>
-        <Field label="缓存写 / 1M"><input value={form.cache_write_per_million} onChange={(e) => setForm({ ...form, cache_write_per_million: e.target.value })} className="w-full rounded-2xl border-2 border-slate-800 bg-amber-50 px-3 py-2 font-mono outline-none focus:bg-white" /></Field>
+        <Field label="官方输入 / 1M"><input value={form.input_per_million} onChange={(e) => setForm({ ...form, input_per_million: e.target.value })} className="w-full rounded-2xl border-2 border-slate-800 bg-amber-50 px-3 py-2 font-mono outline-none focus:bg-white" /></Field>
+        <Field label="官方输出 / 1M"><input value={form.output_per_million} onChange={(e) => setForm({ ...form, output_per_million: e.target.value })} className="w-full rounded-2xl border-2 border-slate-800 bg-amber-50 px-3 py-2 font-mono outline-none focus:bg-white" /></Field>
+        <Field label="官方缓存读 / 1M"><input value={form.cache_read_per_million} onChange={(e) => setForm({ ...form, cache_read_per_million: e.target.value })} className="w-full rounded-2xl border-2 border-slate-800 bg-amber-50 px-3 py-2 font-mono outline-none focus:bg-white" /></Field>
+        <Field label="官方缓存写 / 1M"><input value={form.cache_write_per_million} onChange={(e) => setForm({ ...form, cache_write_per_million: e.target.value })} className="w-full rounded-2xl border-2 border-slate-800 bg-amber-50 px-3 py-2 font-mono outline-none focus:bg-white" /></Field>
         <Field label="状态"><select value={form.status} onChange={(e) => setForm({ ...form, status: e.target.value })} className="w-full rounded-2xl border-2 border-slate-800 bg-white px-3 py-2 font-bold">
           <option value="active">active</option><option value="inactive">inactive</option>
         </select></Field>
-        <Field label="改价原因（必填）" full><input value={form.reason} onChange={(e) => setForm({ ...form, reason: e.target.value })} className="w-full rounded-2xl border-2 border-slate-800 bg-amber-50 px-3 py-2 outline-none focus:bg-white" /></Field>
+        <Field label="折后输入 / 1M"><div className="rounded-2xl border-2 border-slate-800 bg-slate-50 px-3 py-2 font-mono">{formatAdminPrice(discountedModelPrice(form.input_per_million, target))}</div></Field>
+        <Field label="折后输出 / 1M"><div className="rounded-2xl border-2 border-slate-800 bg-slate-50 px-3 py-2 font-mono">{formatAdminPrice(discountedModelPrice(form.output_per_million, target))}</div></Field>
       </div>
       <ModalActions>
         <button onClick={onClose} className="mt-5 rounded-full border-2 border-slate-800 bg-white px-5 py-2 font-bold lift">取消</button>
@@ -609,6 +683,13 @@ function ModelEditorModal({ open, target, onClose, onDone }: { open: boolean; ta
       </ModalActions>
     </Modal>
   );
+}
+
+function discountedModelPrice(value: unknown, target: AnyRow | null): string {
+  const official = Number(value ?? 0);
+  const discount = Number((target?.price as AnyRow | undefined)?.discount_percent ?? 10);
+  if (!Number.isFinite(official) || !Number.isFinite(discount)) return "0";
+  return String((official * discount) / 100);
 }
 
 function ModelRoutingModal({ open, target, onClose, onDone }: { open: boolean; target: AnyRow | null; onClose: () => void; onDone: () => void }) {
@@ -664,7 +745,7 @@ function ModelRoutingModal({ open, target, onClose, onDone }: { open: boolean; t
     <Modal open={open} onClose={onClose} title="模型 Share 路由" description={target ? `${String(target.model_pattern)} · 默认跟随 ForSale 和 client capability 自动路由` : ""} width="lg">
       <div className="grid gap-4">
         <div className="rounded-3xl border-2 border-slate-800 bg-emerald-50 p-4 text-sm text-slate-700">
-          默认模式会自动使用已 ForSale 且 client 声明支持对应 Claude/Codex/Gemini 的 share。Market 黑名单在 Shares 页维护，优先级高于自动路由和手动绑定。
+          默认模式会自动使用已 ForSale 且 client 声明支持对应 Claude/Codex/Gemini 的 share。Market 黑名单在 Shares 页维护，优先级高于自动路由和手动绑定
         </div>
         <Field label="路由模式"><select value={mode} onChange={(e) => setMode(e.target.value)} className="w-full rounded-2xl border-2 border-slate-800 bg-white px-3 py-2 font-bold">
           <option value="all">自动路由（推荐）</option>
@@ -672,7 +753,7 @@ function ModelRoutingModal({ open, target, onClose, onDone }: { open: boolean; t
           <option value="include_only">只允许选中 share</option>
         </select></Field>
         <div className="max-h-80 overflow-auto rounded-3xl border-2 border-slate-800 bg-white p-3">
-          {shares.length === 0 ? <EmptyState shape="circle" title="暂无 share" hint="先在 Shares tab 同步 router shares。" /> : shares.map((s) => {
+          {shares.length === 0 ? <EmptyState shape="circle" title="暂无 share" hint="先在 Shares tab 同步 router shares" /> : shares.map((s) => {
             const key = `${String(s.router_id)}:${String(s.share_id)}`;
             return (
               <label key={key} className="mb-2 flex items-center gap-3 rounded-2xl border-2 border-slate-200 bg-amber-50 px-3 py-2 text-sm">
@@ -786,7 +867,7 @@ function SharesTab() {
         rows={items ?? []}
         loading={items === null}
         rowKey={(r, i) => String(r.share_id ?? i)}
-        empty={<EmptyState shape="circle" title="暂无 share 缓存" hint="点击「同步 Router Shares」从 router 拉取。" />}
+        empty={<EmptyState shape="circle" title="暂无 share 缓存" hint="点击「同步 Router Shares」从 router 拉取" />}
         columns={[
           { key: "share", header: "Share", render: (r) => <span className="font-mono text-xs break-all">{String(r.share_id ?? "")}</span> },
           { key: "owner", header: "Owner", render: (r) => <span className="font-mono text-sm">{String(r.owner_email ?? r.installation_owner_email ?? "")}</span> },
@@ -902,7 +983,9 @@ function ChargesTab() {
           { key: "rid", header: "Request", render: (r) => <span className="font-mono text-xs break-all">{String(r.request_id ?? "")}</span> },
           { key: "email", header: "Email", render: (r) => <span className="font-mono text-xs break-all">{String(r.requester_email ?? "")}</span> },
           { key: "share", header: "SHARE", render: (r) => <span className="font-mono text-xs">{String(r.share_subdomain ?? "")}</span> },
-          { key: "model", header: "模型", render: (r) => <span className="font-mono text-sm">{String(r.model ?? "")}</span> },
+          { key: "agent", header: "Agent", render: (r) => <span className="rounded-full bg-violet-100 border-2 border-slate-800 px-2 py-0.5 text-xs font-bold uppercase">{String(r.request_agent ?? r.app_type ?? "")}</span> },
+          { key: "requested", header: "请求模型", render: (r) => <span className="font-mono text-xs break-all">{String(r.requested_model ?? r.model ?? "")}</span> },
+          { key: "actual", header: "真实模型", render: (r) => <span className="font-mono text-xs break-all">{String(r.actual_model ?? r.pricing_model ?? r.model ?? "")}</span> },
           { key: "amount", header: "金额", render: (r) => <span className="font-mono">{r.usage_amount ? `$${r.usage_amount}` : `锁定 $${r.reserved_amount ?? "0"}`}</span> },
           { key: "status", header: "状态", render: (r) => <Pill status={String(r.status ?? "")} /> },
           { key: "time", header: "时间", render: (r) => <span className="text-xs text-slate-500">{formatDate(String(r.created_at ?? ""))}</span> },
@@ -1002,7 +1085,9 @@ function ChargeReviewDetailModal({ target, onClose }: { target: AnyRow | null; o
         <div className="grid gap-4">
           <div className="grid gap-3 md:grid-cols-3">
             <ReviewInfo label="状态" value={<Pill status={String(charge.status ?? "")} />} />
-            <ReviewInfo label="模型" value={<span className="font-mono">{String(charge.model ?? "")}</span>} />
+            <ReviewInfo label="Agent" value={<span className="font-mono">{String(charge.request_agent ?? charge.app_type ?? "")}</span>} />
+            <ReviewInfo label="请求模型" value={<span className="font-mono">{String(charge.requested_model ?? charge.model ?? "")}</span>} />
+            <ReviewInfo label="真实模型" value={<span className="font-mono">{String(charge.actual_model ?? charge.pricing_model ?? charge.model ?? "")}</span>} />
             <ReviewInfo label="创建时间" value={formatDate(String(charge.created_at ?? ""))} />
             <ReviewInfo label="调用用户" value={<span className="font-mono break-all">{String(charge.requester_email ?? "")}</span>} />
             <ReviewInfo label="Share" value={<span className="font-mono break-all">{String(charge.share_subdomain ?? "")}</span>} />
@@ -1035,7 +1120,7 @@ function ChargeReviewDetailModal({ target, onClose }: { target: AnyRow | null; o
 
           <ReviewSection title="Response Meta">
             <ObjectHeader object={responseMetaObject} />
-            {responseMetaObject.json ? <JsonBlock value={responseMetaObject.json} /> : <div className="rounded-2xl border-2 border-slate-800 bg-amber-50 p-4 text-sm text-slate-600">没有 response meta，通常表示尚未成功解析 usage 或尚未完成结算。</div>}
+            {responseMetaObject.json ? <JsonBlock value={responseMetaObject.json} /> : <div className="rounded-2xl border-2 border-slate-800 bg-amber-50 p-4 text-sm text-slate-600">没有 response meta，通常表示尚未成功解析 usage 或尚未完成结算</div>}
           </ReviewSection>
 
           <ReviewSection title="Linux curl 复现">
@@ -1106,13 +1191,13 @@ function parseJsonArray(value: unknown): string[] {
 }
 
 function reviewReasonHint(flags: string[]) {
-  if (flags.includes("non_stream_usage_missing")) return "非流式请求返回成功，但响应中没有可解析的 usage。优先用 curl 复现，确认上游响应是否包含 usage。";
-  if (flags.includes("stream_usage_missing")) return "流式请求结束后没有拿到完整 usage。检查 SSE 尾部事件或客户端是否提前断开。";
-  if (flags.includes("stream_client_disconnected")) return "客户端在流式响应完成前断开，usage 可能尚未到达。";
-  if (flags.includes("stream_upstream_interrupted")) return "上游流中断，无法确认最终 usage。";
-  if (flags.includes("stream_settlement_failed")) return "已解析到 usage，但自动结算失败。检查价格快照、余额和账本。";
-  if (flags.includes("settlement_over_reserved")) return "实际费用超过预授权金额，需要复核是否补扣或释放。";
-  return "根据请求上下文、attempts 和 curl 复现结果决定手动结算或释放。";
+  if (flags.includes("non_stream_usage_missing")) return "非流式请求返回成功，但响应中没有可解析的 usage。优先用 curl 复现，确认上游响应是否包含 usage";
+  if (flags.includes("stream_usage_missing")) return "流式请求结束后没有拿到完整 usage。检查 SSE 尾部事件或客户端是否提前断开";
+  if (flags.includes("stream_client_disconnected")) return "客户端在流式响应完成前断开，usage 可能尚未到达";
+  if (flags.includes("stream_upstream_interrupted")) return "上游流中断，无法确认最终 usage";
+  if (flags.includes("stream_settlement_failed")) return "已解析到 usage，但自动结算失败。检查价格快照、余额和账本";
+  if (flags.includes("settlement_over_reserved")) return "实际费用超过预授权金额，需要复核是否补扣或释放";
+  return "根据请求上下文、attempts 和 curl 复现结果决定手动结算或释放";
 }
 
 function SettleManualModal({ target, onClose, onDone }: { target: AnyRow | null; onClose: () => void; onDone: () => void }) {
@@ -1165,7 +1250,7 @@ function ReleaseChargeModal({ target, onClose, onDone }: { target: AnyRow | null
     }
   }
   return (
-    <Modal open={!!target} onClose={onClose} title="释放预授权" description="将锁定金额退回 user_cash，不计入 client_payable。">
+    <Modal open={!!target} onClose={onClose} title="释放预授权" description="将锁定金额退回 user_cash，不计入 client_payable">
       <textarea value={reason} onChange={(e) => setReason(e.target.value)} placeholder="释放原因" className="min-h-24 w-full rounded-2xl border-2 border-slate-800 bg-amber-50 px-4 py-3 outline-none focus:bg-white" />
       <ModalActions>
         <button onClick={onClose} className="mt-5 rounded-full border-2 border-slate-800 bg-white px-5 py-2 font-bold lift">取消</button>
@@ -1508,7 +1593,7 @@ function TicketsTab() {
       {!activeId ? (
         <div className="grid gap-3">
           {items === null && <Skeleton className="h-20 w-full rounded-2xl" />}
-          {items && sortedFilteredItems.length === 0 && <EmptyState shape="circle" title="没有匹配工单" hint="试试修改筛选条件。" />}
+          {items && sortedFilteredItems.length === 0 && <EmptyState shape="circle" title="没有匹配工单" hint="试试修改筛选条件" />}
           {items && sortedFilteredItems.map((t) => {
             const status = String(t.status ?? "open");
             const priority = String(t.priority ?? "normal");
@@ -1674,9 +1759,9 @@ function AdminTicketDetails({ id, onChanged }: { id: string; onChanged: () => vo
             最近对外动作：<b>{String(details.last_external_sender ?? ticket.last_external_sender ?? "—")}</b>
           </div>
           {autoCloseAt ? (
-            <div className="mt-2">若用户在 <span className="font-mono">{formatDate(autoCloseAt)}</span> 前未回复，将自动关闭。</div>
+            <div className="mt-2">若用户在 <span className="font-mono">{formatDate(autoCloseAt)}</span> 前未回复，将自动关闭</div>
           ) : (
-            <div className="mt-2 text-slate-600">仅当工单为 waiting_user 且最近一条对外消息来自管理员时，才会进入 7 天倒计时。</div>
+            <div className="mt-2 text-slate-600">仅当工单为 waiting_user 且最近一条对外消息来自管理员时，才会进入 7 天倒计时</div>
           )}
         </div>
       </div>
@@ -1991,7 +2076,7 @@ function AnnouncementsTab() {
               </div>
             </div>
             <p className="text-sm text-slate-500">
-              当前公告事实源仍是本地浏览器存储。此入口可增删改并即时影响导航铃铛与公告弹窗。
+              当前公告事实源仍是本地浏览器存储。此入口可增删改并即时影响导航铃铛与公告弹窗
             </p>
             <div className="rounded-2xl border-2 border-slate-800 bg-amber-50 p-4">
               <div className="text-xs uppercase tracking-wider text-slate-500">中文标题</div>
@@ -2094,7 +2179,7 @@ function LedgerCheckTab() {
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h3 className="font-display text-xl font-extrabold">账本一致性</h3>
-            <p className="text-sm text-slate-700">余额与账本聚合应完全一致。</p>
+            <p className="text-sm text-slate-700">余额与账本聚合应完全一致</p>
           </div>
           <div className="flex items-center gap-3">
             <Pill variant={check?.ok ? "success" : "failed"}>{check?.ok ? "OK" : "异常"}</Pill>
@@ -2203,6 +2288,7 @@ function SettingsTab() {
   const adminTablePageSize = settings?.adminTablePageSize ?? 20;
   const tabs: { key: string; label: string }[] = [
     { key: "system", label: c.tabs.system },
+    { key: "version", label: c.tabs.version },
     ...env.categories.map((cat) => ({ key: cat.key, label: c.categories[cat.key as keyof typeof c.categories] ?? cat.key })),
   ];
   const visibleFields = env.fields.filter((field) => field.category === active);
@@ -2331,8 +2417,8 @@ function SettingsTab() {
         <nav aria-label={c.title} className="flex md:flex-col gap-2 overflow-x-auto md:overflow-visible pb-1">
           {tabs.map((tab) => {
             const isActive = active === tab.key;
-            const dirtyCount = tab.key !== "system" ? dirtyCountForCategory(tab.key) : 0;
-            const missingCount = tab.key !== "system" ? missingCountForCategory(tab.key) : 0;
+            const dirtyCount = !["system", "version"].includes(tab.key) ? dirtyCountForCategory(tab.key) : 0;
+            const missingCount = !["system", "version"].includes(tab.key) ? missingCountForCategory(tab.key) : 0;
             return (
               <button
                 key={tab.key}
@@ -2419,6 +2505,8 @@ function SettingsTab() {
               onRemove={removeFooterItem}
             />
           </div>
+        ) : active === "version" ? (
+          <VersionPanel />
         ) : (
           <div className="sticker bg-white p-6">
             <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
@@ -2506,6 +2594,142 @@ type AdminSettings = {
   footerLinks?: FooterLinkItem[];
   footerIcons?: string[];
 };
+
+type AdminVersionInfo = {
+  version: string;
+  git_sha: string;
+  git_ref: string;
+  build_time: string;
+  target: string;
+  pid: number;
+  uptime_seconds: number;
+  current_exe: string;
+  binary_path: string;
+  log_path: string;
+  service_name: string;
+  service_exists: boolean;
+  release_binary_url: string;
+};
+
+function VersionPanel() {
+  const { locale } = useLocale();
+  const c = copy[locale].admin.settings.version;
+  const toast = useToast();
+  const [info, setInfo] = useState<AdminVersionInfo | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState<"restart" | "update" | null>(null);
+
+  function reload() {
+    setLoading(true);
+    apiGet<AdminVersionInfo>("/v1/admin/version")
+      .then(setInfo)
+      .catch(() => setInfo(null))
+      .finally(() => setLoading(false));
+  }
+
+  useEffect(() => { reload(); }, []);
+
+  async function waitForService() {
+    const deadline = Date.now() + 90_000;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 2500));
+      try {
+        await apiGet<AdminVersionInfo>(`/v1/admin/version?ts=${Date.now()}`);
+        window.location.reload();
+        return;
+      } catch {
+        // service is still restarting
+      }
+    }
+    window.location.reload();
+  }
+
+  async function runAction(kind: "restart" | "update") {
+    if (!window.confirm(kind === "restart" ? c.confirmRestart : c.confirmUpdate)) return;
+    setBusy(kind);
+    try {
+      await apiPost<{ ok: boolean; mode: string }>(`/v1/admin/version/${kind}`, {});
+      toast.push({
+        variant: "success",
+        title: kind === "restart" ? c.restartScheduled : c.updateScheduled,
+        description: c.recovering,
+      });
+      void waitForService();
+    } catch (err) {
+      toast.push({ variant: "error", title: c.actionFailed, description: String(err).replace(/^Error:\s*/, "") });
+      setBusy(null);
+    }
+  }
+
+  const rows = info ? [
+    [c.currentVersion, info.version],
+    [c.commit, shortSha(info.git_sha)],
+    [c.gitRef, info.git_ref || c.unknown],
+    [c.buildTime, info.build_time || c.unknown],
+    [c.target, info.target],
+    [c.pid, String(info.pid)],
+    [c.uptime, formatUptime(info.uptime_seconds)],
+    [c.serviceMode, info.service_exists ? c.systemd : c.manual],
+    [c.currentExe, info.current_exe],
+    [c.binaryPath, info.binary_path],
+    [c.logPath, info.log_path],
+    [c.releaseUrl, info.release_binary_url],
+  ] : [];
+
+  return (
+    <div className="sticker bg-white p-6">
+      <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="font-display text-xl font-extrabold">{c.title}</div>
+          <p className="mt-1 text-sm text-slate-500">{c.subtitle}</p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <button onClick={() => window.location.reload()} className="inline-flex items-center gap-2 rounded-full border-2 border-slate-800 bg-white px-4 py-2 text-sm font-bold hover:bg-amber-300">
+            <RefreshCw size={15} /> {c.pageRefresh}
+          </button>
+          <button onClick={() => runAction("restart")} disabled={!!busy} className="inline-flex items-center gap-2 rounded-full border-2 border-slate-800 bg-amber-300 px-4 py-2 text-sm font-bold disabled:opacity-50">
+            <RotateCw size={15} /> {busy === "restart" ? c.recovering : c.restart}
+          </button>
+          <button onClick={() => runAction("update")} disabled={!!busy} className="inline-flex items-center gap-2 rounded-full border-2 border-slate-800 bg-violet-500 px-4 py-2 text-sm font-bold text-white disabled:opacity-50">
+            <RefreshCw size={15} /> {busy === "update" ? c.recovering : c.update}
+          </button>
+        </div>
+      </div>
+      {loading ? (
+        <div className="rounded-2xl border-2 border-slate-200 bg-amber-50 p-6 text-sm font-bold text-slate-600">{c.loading}</div>
+      ) : !info ? (
+        <div className="rounded-2xl border-2 border-pink-300 bg-pink-50 p-6 text-sm font-bold text-pink-700">{c.loadFailed}</div>
+      ) : (
+        <dl className="grid gap-3 md:grid-cols-2">
+          {rows.map(([label, value]) => (
+            <div key={label} className="rounded-2xl border-2 border-slate-200 bg-amber-50 p-4">
+              <dt className="text-xs font-bold uppercase tracking-wider text-slate-500">{label}</dt>
+              <dd className="mt-1 break-all font-mono text-sm font-bold text-slate-900">{value}</dd>
+            </div>
+          ))}
+        </dl>
+      )}
+    </div>
+  );
+}
+
+function shortSha(value: string): string {
+  if (!value || value === "unknown") return value || "unknown";
+  return value.slice(0, 12);
+}
+
+function formatUptime(seconds: number): string {
+  const day = Math.floor(seconds / 86400);
+  const hour = Math.floor((seconds % 86400) / 3600);
+  const minute = Math.floor((seconds % 3600) / 60);
+  const second = Math.floor(seconds % 60);
+  return [
+    day ? `${day}d` : "",
+    hour ? `${hour}h` : "",
+    minute ? `${minute}m` : "",
+    `${second}s`,
+  ].filter(Boolean).join(" ");
+}
 
 type FooterLinkItem = {
   labelZh: string;

@@ -278,6 +278,8 @@ API：
 - `POST /v1/api-keys`
 - `POST /v1/topups/checkout`
 - `POST /v1/chat/completions`
+- `POST /v1/responses`
+- `POST /responses`
 - `POST /v1/messages`
 - `GET /v1/provider/claim/summary`
 - `POST /v1/provider/claim/payout`

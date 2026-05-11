@@ -334,6 +334,8 @@ fn build_router(state: AppState) -> Router {
         .route("/v1/usage", get(proxy::usage))
         .route("/v1/usage/{id}/report", post(support::report_usage))
         .route("/v1/chat/completions", post(proxy::chat_completions))
+        .route("/v1/responses", post(proxy::responses))
+        .route("/responses", post(proxy::responses))
         .route("/v1/messages", post(proxy::messages))
         .route("/v1beta/models/{*path}", post(proxy::gemini_models_v1beta))
         .route("/v1/models/{*path}", post(proxy::gemini_models_v1))

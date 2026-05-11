@@ -390,6 +390,8 @@ pub async fn docs() -> Json<serde_json::Value> {
             ],
             "proxy": [
                 "POST /v1/chat/completions",
+                "POST /v1/responses",
+                "POST /responses",
                 "POST /v1/messages"
             ],
             "provider": [

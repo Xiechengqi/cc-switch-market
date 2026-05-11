@@ -113,6 +113,14 @@ pub async fn chat_completions(
     handle_llm_request(state, parts, body, "openai", "/v1/chat/completions").await
 }
 
+pub async fn responses(
+    State(state): State<AppState>,
+    parts: RequestMeta,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    handle_llm_request(state, parts, body, "openai", "/v1/responses").await
+}
+
 pub async fn messages(
     State(state): State<AppState>,
     parts: RequestMeta,

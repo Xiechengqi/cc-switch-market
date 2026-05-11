@@ -327,11 +327,23 @@ fn codex_usage(value: &Value) -> Option<UsageParts> {
 }
 
 fn gemini_usage(value: &Value) -> Option<UsageParts> {
-    let usage = value
-        .get("usageMetadata")
-        .or_else(|| value.pointer("/response/usageMetadata"))?;
+    let usage = find_gemini_usage_metadata(value)?;
     let input_tokens = usage.get("promptTokenCount").and_then(Value::as_u64)?;
-    let total_tokens = usage.get("totalTokenCount").and_then(Value::as_u64)?;
+    let total_tokens = usage
+        .get("totalTokenCount")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            let candidates = usage.get("candidatesTokenCount").and_then(Value::as_u64)?;
+            let thoughts = usage
+                .get("thoughtsTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            Some(
+                input_tokens
+                    .saturating_add(candidates)
+                    .saturating_add(thoughts),
+            )
+        })?;
     Some(UsageParts {
         input_tokens,
         output_tokens: total_tokens.saturating_sub(input_tokens),
@@ -341,6 +353,43 @@ fn gemini_usage(value: &Value) -> Option<UsageParts> {
             .unwrap_or(0),
         cache_write_tokens: 0,
     })
+}
+
+fn find_gemini_usage_metadata(value: &Value) -> Option<&Value> {
+    find_gemini_usage_metadata_at_depth(value, 0)
+}
+
+fn find_gemini_usage_metadata_at_depth(value: &Value, depth: usize) -> Option<&Value> {
+    if depth > 4 {
+        return None;
+    }
+    if value
+        .get("promptTokenCount")
+        .and_then(Value::as_u64)
+        .is_some()
+        && (value
+            .get("totalTokenCount")
+            .and_then(Value::as_u64)
+            .is_some()
+            || value
+                .get("candidatesTokenCount")
+                .and_then(Value::as_u64)
+                .is_some())
+    {
+        return Some(value);
+    }
+    if let Some(usage) = value.get("usageMetadata") {
+        return Some(usage);
+    }
+    match value {
+        Value::Object(object) => object
+            .values()
+            .find_map(|item| find_gemini_usage_metadata_at_depth(item, depth + 1)),
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| find_gemini_usage_metadata_at_depth(item, depth + 1)),
+        _ => None,
+    }
 }
 
 fn strip_sse_field<'a>(line: &'a str, field: &str) -> Option<&'a str> {
@@ -488,5 +537,40 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":100}}}
         assert_eq!(usage.output_tokens, 220);
         assert_eq!(usage.cache_read_tokens, 0);
         assert_eq!(usage.source, "market_gemini_usage");
+    }
+
+    #[test]
+    fn parses_wrapped_gemini_stream_usage_metadata() {
+        let mut parser = SseUsageParser::new(UsageProtocol::Gemini);
+        parser.feed(
+            br#"data: {"metadata":{"remoteContext":{"ragState":"RAG_DISABLED"}},"response":{"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":11,"thoughtsTokenCount":209,"totalTokenCount":224}}}
+
+"#,
+        );
+        let usage = parser.usage().expect("usage");
+        assert_eq!(usage.input_tokens, 4);
+        assert_eq!(usage.output_tokens, 220);
+        assert_eq!(usage.source, "market_gemini_stream_usage");
+    }
+
+    #[test]
+    fn parses_nested_gemini_usage_without_total_tokens() {
+        let usage = extract_response_usage(
+            &json!({
+                "chunk": {
+                    "response": {
+                        "usageMetadata": {
+                            "promptTokenCount": 4,
+                            "candidatesTokenCount": 11,
+                            "thoughtsTokenCount": 209
+                        }
+                    }
+                }
+            }),
+            UsageProtocol::Gemini,
+        )
+        .expect("usage");
+        assert_eq!(usage.input_tokens, 4);
+        assert_eq!(usage.output_tokens, 220);
     }
 }

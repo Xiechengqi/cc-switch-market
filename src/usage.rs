@@ -327,7 +327,9 @@ fn codex_usage(value: &Value) -> Option<UsageParts> {
 }
 
 fn gemini_usage(value: &Value) -> Option<UsageParts> {
-    let usage = value.get("usageMetadata")?;
+    let usage = value
+        .get("usageMetadata")
+        .or_else(|| value.pointer("/response/usageMetadata"))?;
     let input_tokens = usage.get("promptTokenCount").and_then(Value::as_u64)?;
     let total_tokens = usage.get("totalTokenCount").and_then(Value::as_u64)?;
     Some(UsageParts {
@@ -462,5 +464,29 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":100}}}
         assert_eq!(usage.input_tokens, 7);
         assert_eq!(usage.output_tokens, 9);
         assert_eq!(usage.cache_write_tokens, 2);
+    }
+
+    #[test]
+    fn parses_wrapped_gemini_usage_metadata() {
+        let usage = extract_response_usage(
+            &json!({
+                "metadata": {"remoteContext": {"ragState": "RAG_DISABLED"}},
+                "response": {
+                    "usageMetadata": {
+                        "promptTokenCount": 4,
+                        "candidatesTokenCount": 11,
+                        "thoughtsTokenCount": 209,
+                        "totalTokenCount": 224
+                    }
+                },
+                "traceId": "3826900527cc2923"
+            }),
+            UsageProtocol::Gemini,
+        )
+        .expect("usage");
+        assert_eq!(usage.input_tokens, 4);
+        assert_eq!(usage.output_tokens, 220);
+        assert_eq!(usage.cache_read_tokens, 0);
+        assert_eq!(usage.source, "market_gemini_usage");
     }
 }

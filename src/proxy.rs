@@ -393,15 +393,23 @@ async fn handle_llm_request_with_model(
     {
         Ok(value) => value,
         Err(err) => {
-            release_reserved_request(
+            let error_message = err.to_string();
+            if let Err(release_err) = release_reserved_request(
                 &state,
                 api.user_id,
                 charge_id,
                 idempotency_key.as_deref(),
                 reserved_amount,
-                serde_json::json!([{"code":"upstream_failed","message": err.to_string()}]),
+                serde_json::json!([{"code":"upstream_failed","message": error_message}]),
             )
-            .await?;
+            .await
+            {
+                tracing::warn!(
+                    %charge_id,
+                    error = %release_err,
+                    "failed to release reserved charge after upstream failure"
+                );
+            }
             return Err(err);
         }
     };
@@ -524,15 +532,23 @@ async fn handle_openai_stream(
     {
         Ok(value) => value,
         Err(err) => {
-            release_reserved_request(
-                    &state,
-                    api.user_id,
-                    charge_id,
-                    idempotency_key.as_deref(),
-                    reserved_amount,
-                    serde_json::json!([{"code":"upstream_failed_before_stream","message": err.to_string()}]),
-                )
-                .await?;
+            let error_message = err.to_string();
+            if let Err(release_err) = release_reserved_request(
+                &state,
+                api.user_id,
+                charge_id,
+                idempotency_key.as_deref(),
+                reserved_amount,
+                serde_json::json!([{"code":"upstream_failed_before_stream","message": error_message}]),
+            )
+            .await
+            {
+                tracing::warn!(
+                    %charge_id,
+                    error = %release_err,
+                    "failed to release reserved charge after stream upstream failure"
+                );
+            }
             return Err(err);
         }
     };
@@ -820,7 +836,7 @@ async fn release_reserved_request(
     audit_flags: serde_json::Value,
 ) -> Result<(), ApiError> {
     let tx = state.db().begin_immediate().await?;
-    tx.execute(
+    let changed = tx.execute(
         "UPDATE request_charges SET status='failed_released', audit_flags=?2, settled_at=?3 WHERE id=?1 AND status='reserved'",
         vec![
             crate::db::uuid_val(charge_id),
@@ -829,33 +845,37 @@ async fn release_reserved_request(
         ],
     )
     .await?;
-    ledger::transfer(
-        &tx,
-        AccountRef::User {
-            account_type: "user_reserved",
-            user_id,
-        },
-        AccountRef::User {
-            account_type: "user_cash",
-            user_id,
-        },
-        reserved_amount,
-        "request_charge",
-        charge_id,
-        "system",
-        Some("proxy"),
-    )
-    .await?;
-    if let Some(key) = idempotency_key {
-        tx.execute(
-            "UPDATE request_idempotency SET status='failed_released', completed_at=?3 WHERE user_id=?1 AND idempotency_key=?2",
-            vec![
-                crate::db::uuid_val(user_id),
-                crate::db::val(key),
-                crate::db::val(crate::db::now_string()),
-            ],
+    if changed > 0 {
+        ledger::transfer(
+            &tx,
+            AccountRef::User {
+                account_type: "user_reserved",
+                user_id,
+            },
+            AccountRef::User {
+                account_type: "user_cash",
+                user_id,
+            },
+            reserved_amount,
+            "request_charge",
+            charge_id,
+            "system",
+            Some("proxy"),
         )
         .await?;
+    }
+    if changed > 0 {
+        if let Some(key) = idempotency_key {
+            tx.execute(
+                "UPDATE request_idempotency SET status='failed_released', completed_at=?3 WHERE user_id=?1 AND idempotency_key=?2",
+                vec![
+                    crate::db::uuid_val(user_id),
+                    crate::db::val(key),
+                    crate::db::val(crate::db::now_string()),
+                ],
+            )
+            .await?;
+        }
     }
     tx.commit().await?;
     trigger_router_request_log_sync(state.clone());
@@ -2219,7 +2239,7 @@ async fn select_share_candidates(
     let rows = db.query_all(
         r#"
         SELECT router_id, share_id, COALESCE(owner_email, installation_owner_email) AS owner_email,
-               app_type, enabled_codex, active_requests, parallel_limit, priority, online_rate_24h
+               app_type, enabled_codex, active_requests, parallel_limit, priority, online_rate_24h, raw_json
           FROM router_shares
          WHERE (app_type IN (?1, ?8)
                 OR (?9 = 1 AND enabled_codex = 1)
@@ -2301,6 +2321,13 @@ async fn select_share_candidates(
         else {
             continue;
         };
+        let share_sale_percent =
+            share_sale_percent_from_raw(&row.opt_string("raw_json"), capability);
+        if let Some(share_sale_percent) = share_sale_percent {
+            if price.discount_percent < rust_decimal::Decimal::from(share_sale_percent) {
+                continue;
+            }
+        }
         if !api_key_allows_model_access(
             api,
             capability,
@@ -2342,6 +2369,19 @@ async fn select_share_candidates(
     } else {
         Ok(shares)
     }
+}
+
+fn share_sale_percent_from_raw(raw_json: &Option<String>, capability: &str) -> Option<u16> {
+    let raw = raw_json.as_deref()?;
+    let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    let percent = value
+        .get("appRuntimes")
+        .and_then(|runtimes| runtimes.get(capability))
+        .and_then(|runtime| runtime.get("forSaleOfficialPricePercent"))?;
+    percent
+        .as_u64()
+        .and_then(|value| u16::try_from(value).ok())
+        .filter(|value| (1..=100).contains(value))
 }
 
 #[allow(clippy::too_many_arguments)]

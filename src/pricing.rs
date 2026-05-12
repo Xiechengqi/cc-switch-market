@@ -777,6 +777,32 @@ pub fn cost_with_cache(
             / million
 }
 
+pub async fn pricing_summary(db: &crate::db::Db) -> anyhow::Result<serde_json::Value> {
+    let rows = db
+        .query_all(
+            r#"
+            SELECT app_type, discount_percent
+              FROM model_vendor_discounts
+             WHERE app_type IN ('claude', 'codex', 'gemini', 'deepseek')
+             ORDER BY app_type
+            "#,
+            vec![],
+        )
+        .await?;
+    let mut summary = serde_json::Map::new();
+    for row in rows {
+        let app_type = row.string("app_type");
+        let discount = row.decimal("discount_percent");
+        summary.insert(app_type, serde_json::Value::String(discount.to_string()));
+    }
+    for app_type in ["claude", "codex", "gemini", "deepseek"] {
+        summary
+            .entry(app_type.to_string())
+            .or_insert_with(|| serde_json::Value::Number(serde_json::Number::from(10)));
+    }
+    Ok(serde_json::Value::Object(summary))
+}
+
 async fn fetch_prices(db: &crate::db::Db, public_only: bool) -> Result<Vec<PriceItem>, ApiError> {
     let mut sql = r#"
         SELECT mp.id, mp.model_id, mp.app_type, mp.model_pattern, m.display_name, m.is_public, mp.input_per_million, mp.output_per_million, mp.cache_read_per_million,

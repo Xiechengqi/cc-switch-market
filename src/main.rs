@@ -124,7 +124,9 @@ async fn main() -> anyhow::Result<()> {
         db_mode = if config.turso_database_url.is_some() { "turso" } else { "local_sqlite" },
         "loaded cc-switch-market configuration"
     );
-    let session = router_account::register_market(&config).await.with_context(|| {
+    let state = AppState::new(config.clone()).await?;
+    let pricing_summary = pricing::pricing_summary(state.db()).await.ok();
+    let session = router_account::register_market(&config, pricing_summary).await.with_context(|| {
         "router market registration failed. Run `cc-switch-market login` first and verify ROUTER_BASE_DOMAIN/ROUTER_MARKET_SUBDOMAIN"
     })?;
     tracing::info!(
@@ -132,8 +134,6 @@ async fn main() -> anyhow::Result<()> {
         public_base_url = %config.market_public_base_url,
         "router market registration is ready"
     );
-    let state = AppState::new(config.clone()).await?;
-
     let _db_sync = db::spawn_turso_sync(config.clone(), state.db.clone());
     let _db_backup = db::spawn_turso_backup(config.clone(), state.db.clone());
     let _topup_expiry = topups::spawn_order_expiry(state.clone());
@@ -141,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
     let _gateio_worker = admin::spawn_gateio_worker(state.clone());
     let _share_sync = router_client::spawn_share_sync(state.clone());
     let _request_log_sync = router_request_logs::spawn_sync(state.clone());
+    let _market_pricing_sync = spawn_market_pricing_sync(state.clone());
     let app = build_router(state.clone());
     let addr: SocketAddr = config
         .market_http_addr
@@ -152,6 +153,20 @@ async fn main() -> anyhow::Result<()> {
     let _market_tunnel = market_tunnel::spawn(config.clone());
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn spawn_market_pricing_sync(state: AppState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        loop {
+            interval.tick().await;
+            let pricing_summary = pricing::pricing_summary(state.db()).await.ok();
+            if let Err(err) = router_account::register_market(&state.config, pricing_summary).await
+            {
+                tracing::warn!(error = %err, "sync market pricing summary to router failed");
+            }
+        }
+    })
 }
 
 fn print_help() {

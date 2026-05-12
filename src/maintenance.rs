@@ -9,7 +9,9 @@ use crate::{
 
 const STALE_RESERVED_REQUEST_MINUTES: i64 = 10;
 const CLIENT_DISCONNECT_REVIEW_RELEASE_MINUTES: i64 = 5;
-const CLIENT_DISCONNECT_AUTO_RELEASE_FLAG: &str = "auto_released_client_disconnected_usage_missing";
+const STREAM_USAGE_MISSING_AUTO_RELEASE_FLAG: &str = "auto_released_stream_usage_missing";
+const STALE_RESERVED_AUTO_RELEASE_FLAG: &str = "auto_released_stale_reserved";
+const STALE_STREAMING_REVIEW_FLAG: &str = "auto_marked_stale_streaming";
 
 pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -128,8 +130,11 @@ async fn cleanup_once(state: &AppState) -> anyhow::Result<()> {
     if let Err(err) = release_stale_reserved_charges(state).await {
         tracing::warn!(error = %err, "release stale reserved charges failed");
     }
-    if let Err(err) = release_client_disconnected_usage_missing_reviews(state).await {
-        tracing::warn!(error = %err, "release client-disconnected usage-missing reviews failed");
+    if let Err(err) = mark_stale_streaming_charges_for_review(state).await {
+        tracing::warn!(error = %err, "mark stale streaming charges for review failed");
+    }
+    if let Err(err) = release_stream_usage_missing_reviews(state).await {
+        tracing::warn!(error = %err, "release stream usage-missing reviews failed");
     }
     Ok(())
 }
@@ -140,14 +145,41 @@ async fn release_stale_reserved_charges(state: &AppState) -> anyhow::Result<()> 
         .db()
         .query_all(
             r#"
-            SELECT rc.id, rc.request_id, rc.user_id, rc.reserved_amount, rc.created_at
+            SELECT rc.id,
+                   rc.request_id,
+                   rc.user_id,
+                   rc.reserved_amount,
+                   rc.created_at,
+                   CASE
+                     WHEN NOT EXISTS (
+                       SELECT 1
+                         FROM request_attempts ra
+                        WHERE ra.charge_id = rc.id
+                     ) THEN 'no_request_attempt_after_reserve'
+                     ELSE 'all_request_attempts_failed'
+                   END AS release_reason
               FROM request_charges rc
              WHERE rc.status = 'reserved'
                AND rc.created_at < ?1
-               AND NOT EXISTS (
-                 SELECT 1
-                   FROM request_attempts ra
-                  WHERE ra.charge_id = rc.id
+               AND (
+                 NOT EXISTS (
+                   SELECT 1
+                     FROM request_attempts ra
+                    WHERE ra.charge_id = rc.id
+                 )
+                 OR (
+                   EXISTS (
+                     SELECT 1
+                       FROM request_attempts ra
+                      WHERE ra.charge_id = rc.id
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1
+                       FROM request_attempts ra
+                      WHERE ra.charge_id = rc.id
+                        AND ra.status <> 'error'
+                   )
+                 )
                )
              ORDER BY rc.created_at ASC
              LIMIT 100
@@ -161,12 +193,22 @@ async fn release_stale_reserved_charges(state: &AppState) -> anyhow::Result<()> 
         let user_id = row.uuid("user_id");
         let request_id = row.string("request_id");
         let reserved_amount = row.decimal("reserved_amount");
-        match release_stale_reserved_charge(state, charge_id, user_id, reserved_amount).await {
+        let release_reason = row.string("release_reason");
+        match release_stale_reserved_charge(
+            state,
+            charge_id,
+            user_id,
+            reserved_amount,
+            &release_reason,
+        )
+        .await
+        {
             Ok(true) => tracing::warn!(
                 %charge_id,
                 %request_id,
                 reserved_amount = %reserved_amount,
                 created_at = %row.string("created_at"),
+                release_reason = %release_reason,
                 "released stale reserved request charge"
             ),
             Ok(false) => {}
@@ -186,9 +228,11 @@ async fn release_stale_reserved_charge(
     charge_id: Uuid,
     user_id: Uuid,
     reserved_amount: Decimal,
+    release_reason: &str,
 ) -> anyhow::Result<bool> {
     let now = crate::db::now_string();
     let tx = state.db().begin_immediate().await?;
+    let audit_flags = serde_json::json!([STALE_RESERVED_AUTO_RELEASE_FLAG, release_reason,]);
     let changed = tx
         .execute(
             r#"
@@ -198,18 +242,30 @@ async fn release_stale_reserved_charge(
                    settled_at = ?3
              WHERE id = ?1
                AND status = 'reserved'
-               AND NOT EXISTS (
-                 SELECT 1
-                   FROM request_attempts ra
-                  WHERE ra.charge_id = request_charges.id
+               AND (
+                 NOT EXISTS (
+                   SELECT 1
+                     FROM request_attempts ra
+                    WHERE ra.charge_id = request_charges.id
+                 )
+                 OR (
+                   EXISTS (
+                     SELECT 1
+                       FROM request_attempts ra
+                      WHERE ra.charge_id = request_charges.id
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1
+                       FROM request_attempts ra
+                      WHERE ra.charge_id = request_charges.id
+                        AND ra.status <> 'error'
+                   )
+                 )
                )
             "#,
             vec![
                 crate::db::uuid_val(charge_id),
-                crate::db::json_val(serde_json::json!([
-                    "auto_released_stale_reserved",
-                    "no_request_attempt_after_reserve"
-                ])),
+                crate::db::json_val(audit_flags),
                 crate::db::val(&now),
             ],
         )
@@ -239,7 +295,77 @@ async fn release_stale_reserved_charge(
     Ok(true)
 }
 
-async fn release_client_disconnected_usage_missing_reviews(state: &AppState) -> anyhow::Result<()> {
+async fn mark_stale_streaming_charges_for_review(state: &AppState) -> anyhow::Result<()> {
+    let cutoff = (Utc::now() - Duration::minutes(STALE_RESERVED_REQUEST_MINUTES)).to_rfc3339();
+    let stale = state
+        .db()
+        .query_all(
+            r#"
+            SELECT rc.id, rc.request_id, rc.user_id, rc.audit_flags, rc.created_at
+              FROM request_charges rc
+             WHERE rc.status = 'streaming'
+               AND rc.created_at < ?1
+             ORDER BY rc.created_at ASC
+             LIMIT 100
+            "#,
+            vec![crate::db::val(&cutoff)],
+        )
+        .await?;
+
+    for row in stale {
+        let charge_id = row.uuid("id");
+        let request_id = row.string("request_id");
+        let audit_flags = append_audit_flags(
+            row.opt_string("audit_flags"),
+            &[STALE_STREAMING_REVIEW_FLAG, "stream_usage_missing"],
+        );
+        match mark_stale_streaming_charge_for_review(state, charge_id, audit_flags).await {
+            Ok(true) => tracing::warn!(
+                %charge_id,
+                %request_id,
+                created_at = %row.string("created_at"),
+                "marked stale streaming request charge for review"
+            ),
+            Ok(false) => {}
+            Err(err) => tracing::warn!(
+                %charge_id,
+                %request_id,
+                error = %err,
+                "failed to mark stale streaming request charge for review"
+            ),
+        }
+    }
+    Ok(())
+}
+
+async fn mark_stale_streaming_charge_for_review(
+    state: &AppState,
+    charge_id: Uuid,
+    audit_flags: serde_json::Value,
+) -> anyhow::Result<bool> {
+    let changed = state
+        .db()
+        .execute(
+            r#"
+            UPDATE request_charges
+               SET status = 'needs_review',
+                   usage_json = NULL,
+                   audit_flags = ?2,
+                   settled_at = ?3
+             WHERE id = ?1
+               AND status = 'streaming'
+            "#,
+            vec![
+                crate::db::uuid_val(charge_id),
+                crate::db::json_val(audit_flags),
+                crate::db::val(crate::db::now_string()),
+            ],
+        )
+        .await?;
+    Ok(changed > 0)
+}
+
+async fn release_stream_usage_missing_reviews(state: &AppState) -> anyhow::Result<()> {
     let cutoff =
         (Utc::now() - Duration::minutes(CLIENT_DISCONNECT_REVIEW_RELEASE_MINUTES)).to_rfc3339();
     let reviews = state
@@ -252,10 +378,6 @@ async fn release_client_disconnected_usage_missing_reviews(state: &AppState) -> 
                AND rc.usage_json IS NULL
                AND rc.usage_amount IS NULL
                AND COALESCE(rc.settled_at, rc.created_at) < ?1
-               AND EXISTS (
-                 SELECT 1 FROM json_each(rc.audit_flags)
-                  WHERE value = 'stream_client_disconnected'
-               )
                AND EXISTS (
                  SELECT 1 FROM json_each(rc.audit_flags)
                   WHERE value = 'stream_usage_missing'
@@ -274,9 +396,9 @@ async fn release_client_disconnected_usage_missing_reviews(state: &AppState) -> 
         let reserved_amount = row.decimal("reserved_amount");
         let audit_flags = append_audit_flag(
             row.opt_string("audit_flags"),
-            CLIENT_DISCONNECT_AUTO_RELEASE_FLAG,
+            STREAM_USAGE_MISSING_AUTO_RELEASE_FLAG,
         );
-        match release_client_disconnected_usage_missing_review(
+        match release_stream_usage_missing_review(
             state,
             charge_id,
             user_id,
@@ -290,21 +412,21 @@ async fn release_client_disconnected_usage_missing_reviews(state: &AppState) -> 
                 %request_id,
                 reserved_amount = %reserved_amount,
                 settled_at = %row.opt_string("settled_at").unwrap_or_default(),
-                "released client-disconnected usage-missing review charge"
+                "released stream usage-missing review charge"
             ),
             Ok(false) => {}
             Err(err) => tracing::warn!(
                 %charge_id,
                 %request_id,
                 error = %err,
-                "failed to release client-disconnected usage-missing review charge"
+                "failed to release stream usage-missing review charge"
             ),
         }
     }
     Ok(())
 }
 
-async fn release_client_disconnected_usage_missing_review(
+async fn release_stream_usage_missing_review(
     state: &AppState,
     charge_id: Uuid,
     user_id: Uuid,
@@ -324,10 +446,6 @@ async fn release_client_disconnected_usage_missing_review(
                AND status = 'needs_review'
                AND usage_json IS NULL
                AND usage_amount IS NULL
-               AND EXISTS (
-                 SELECT 1 FROM json_each(audit_flags)
-                  WHERE value = 'stream_client_disconnected'
-               )
                AND EXISTS (
                  SELECT 1 FROM json_each(audit_flags)
                   WHERE value = 'stream_usage_missing'
@@ -358,7 +476,7 @@ async fn release_client_disconnected_usage_missing_review(
         "request_charge",
         charge_id,
         "system",
-        Some("maintenance:client-disconnect"),
+        Some("maintenance:stream-usage-missing"),
     )
     .await?;
     tx.commit().await?;
@@ -366,12 +484,18 @@ async fn release_client_disconnected_usage_missing_review(
 }
 
 fn append_audit_flag(current: Option<String>, flag: &str) -> serde_json::Value {
+    append_audit_flags(current, &[flag])
+}
+
+fn append_audit_flags(current: Option<String>, flags_to_add: &[&str]) -> serde_json::Value {
     let mut flags = current
         .as_deref()
         .and_then(|value| serde_json::from_str::<Vec<serde_json::Value>>(value).ok())
         .unwrap_or_default();
-    if !flags.iter().any(|value| value.as_str() == Some(flag)) {
-        flags.push(serde_json::Value::String(flag.to_string()));
+    for flag in flags_to_add {
+        if !flags.iter().any(|value| value.as_str() == Some(*flag)) {
+            flags.push(serde_json::Value::String((*flag).to_string()));
+        }
     }
     serde_json::Value::Array(flags)
 }

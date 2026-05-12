@@ -997,15 +997,7 @@ function ChargesTab() {
               ? <span className="block whitespace-normal break-words text-xs text-pink-700">{String(r.audit_flags)}</span>
               : <span className="text-xs text-slate-400">—</span>
           },
-          { key: "actions", header: "操作", render: (r) =>
-            String(r.status) === "needs_review" ? (
-              <div className="flex flex-wrap gap-2">
-                <button onClick={() => setDetailTarget(r)} className="rounded-full border-2 border-slate-800 bg-white px-3 py-1 text-xs font-bold lift">详情</button>
-                <button onClick={() => setSettleTarget(r)} className="rounded-full border-2 border-slate-800 bg-emerald-200 px-3 py-1 text-xs font-bold lift">手动结算</button>
-                <button onClick={() => setReleaseTarget(r)} className="rounded-full border-2 border-slate-800 bg-pink-200 px-3 py-1 text-xs font-bold lift">释放</button>
-              </div>
-            ) : <span className="text-xs text-slate-400">—</span>
-          }
+          { key: "actions", header: "操作", render: (r) => <ChargeActions row={r} onDetail={setDetailTarget} onSettle={setSettleTarget} onRelease={setReleaseTarget} /> }
         ]}
       />
       <ChargeReviewDetailModal target={detailTarget} onClose={() => setDetailTarget(null)} />
@@ -1013,6 +1005,38 @@ function ChargesTab() {
       <ReleaseChargeModal target={releaseTarget} onClose={() => setReleaseTarget(null)} onDone={reload} />
     </div>
   );
+}
+
+function ChargeActions({
+  row,
+  onDetail,
+  onSettle,
+  onRelease,
+}: {
+  row: AnyRow;
+  onDetail: (row: AnyRow) => void;
+  onSettle: (row: AnyRow) => void;
+  onRelease: (row: AnyRow) => void;
+}) {
+  const status = String(row.status);
+  if (status === "needs_review") {
+    return (
+      <div className="flex flex-wrap gap-2">
+        <button onClick={() => onDetail(row)} className="rounded-full border-2 border-slate-800 bg-white px-3 py-1 text-xs font-bold lift">详情</button>
+        <button onClick={() => onSettle(row)} className="rounded-full border-2 border-slate-800 bg-emerald-200 px-3 py-1 text-xs font-bold lift">手动结算</button>
+        <button onClick={() => onRelease(row)} className="rounded-full border-2 border-slate-800 bg-pink-200 px-3 py-1 text-xs font-bold lift">释放</button>
+      </div>
+    );
+  }
+  if (isAutoReleasedStreamUsageMissingCharge(row)) {
+    return (
+      <div className="grid gap-1">
+        <button onClick={() => onDetail(row)} className="w-fit rounded-full border-2 border-slate-800 bg-white px-3 py-1 text-xs font-bold lift">详情</button>
+        <span className="text-xs font-bold text-slate-500">流式 usage 缺失，已自动释放</span>
+      </div>
+    );
+  }
+  return <span className="text-xs text-slate-400">—</span>;
 }
 
 function compareChargeRows(a: AnyRow, b: AnyRow) {
@@ -1190,7 +1214,17 @@ function parseJsonArray(value: unknown): string[] {
   }
 }
 
+function chargeAuditFlags(row: AnyRow): string[] {
+  return parseJsonArray(row.audit_flags);
+}
+
+function isAutoReleasedStreamUsageMissingCharge(row: AnyRow) {
+  const flags = chargeAuditFlags(row);
+  return String(row.status) === "failed_released" && flags.includes("auto_released_stream_usage_missing");
+}
+
 function reviewReasonHint(flags: string[]) {
+  if (flags.includes("auto_released_stream_usage_missing")) return "流式请求没有返回可结算 usage，系统已自动释放预授权金额";
   if (flags.includes("non_stream_usage_missing")) return "非流式请求返回成功，但响应中没有可解析的 usage。优先用 curl 复现，确认上游响应是否包含 usage";
   if (flags.includes("stream_usage_missing")) return "流式请求结束后没有拿到完整 usage。检查 SSE 尾部事件或客户端是否提前断开";
   if (flags.includes("stream_client_disconnected")) return "客户端在流式响应完成前断开，usage 可能尚未到达";

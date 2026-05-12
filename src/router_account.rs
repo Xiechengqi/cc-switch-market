@@ -199,7 +199,10 @@ pub async fn refresh_session(config: &Config) -> anyhow::Result<RouterSession> {
     Ok(refreshed)
 }
 
-pub async fn register_market(config: &Config) -> anyhow::Result<RouterSession> {
+pub async fn register_market(
+    config: &Config,
+    pricing_summary: Option<serde_json::Value>,
+) -> anyhow::Result<RouterSession> {
     let session = refresh_session(config).await?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
@@ -214,6 +217,7 @@ pub async fn register_market(config: &Config) -> anyhow::Result<RouterSession> {
             "subdomain": config.router_market_subdomain,
             "displayName": config.market_display_name,
             "publicBaseUrl": config.market_public_base_url,
+            "pricingSummary": pricing_summary,
         }))
         .send()
         .await

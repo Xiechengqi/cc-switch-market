@@ -30,6 +30,8 @@ pub struct ShareUpstreamProvider {
     #[serde(default)]
     pub app: String,
     #[serde(default)]
+    pub for_sale_official_price_percent: Option<u16>,
+    #[serde(default)]
     pub api_url: Option<String>,
     #[serde(default)]
     pub models: Vec<ShareUpstreamModel>,

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use tokio::time::{Duration, sleep};
 
 use crate::{app_state::AppState, error::ApiError};
@@ -93,11 +94,14 @@ pub async fn sync_shares(state: &AppState) -> Result<usize, ApiError> {
     let shares: Vec<serde_json::Value> = response.json().await.unwrap_or_default();
     let db = state.db();
     let mut count = 0;
+    let mut seen = HashSet::new();
+    let mut had_invalid_share = false;
     for raw_share in shares {
         let share: RouterShare = match serde_json::from_value(raw_share.clone()) {
             Ok(share) => share,
             Err(err) => {
                 tracing::warn!(error = %err, "skip invalid router share");
+                had_invalid_share = true;
                 continue;
             }
         };
@@ -112,6 +116,7 @@ pub async fn sync_shares(state: &AppState) -> Result<usize, ApiError> {
             .router_id
             .clone()
             .unwrap_or_else(|| "main".to_string());
+        seen.insert((router_id.clone(), share.share_id.clone()));
         let app_type = share
             .app_type
             .clone()
@@ -164,7 +169,38 @@ pub async fn sync_shares(state: &AppState) -> Result<usize, ApiError> {
         sync_share_model_support(db, &router_id, &share.share_id, &share.app_runtimes).await?;
         count += 1;
     }
+    if !had_invalid_share {
+        prune_missing_router_shares(db, &seen).await?;
+    }
     Ok(count)
+}
+
+async fn prune_missing_router_shares(
+    db: &crate::db::Db,
+    seen: &HashSet<(String, String)>,
+) -> Result<(), ApiError> {
+    let rows = db
+        .query_all("SELECT router_id, share_id FROM router_shares", vec![])
+        .await?;
+    for row in rows {
+        let router_id = row.string("router_id");
+        let share_id = row.string("share_id");
+        if seen.contains(&(router_id.clone(), share_id.clone())) {
+            continue;
+        }
+        db.execute(
+            "DELETE FROM router_share_model_support WHERE router_id=?1 AND share_id=?2",
+            vec![crate::db::val(&router_id), crate::db::val(&share_id)],
+        )
+        .await?;
+        db.execute(
+            "DELETE FROM router_shares WHERE router_id=?1 AND share_id=?2",
+            vec![crate::db::val(&router_id), crate::db::val(&share_id)],
+        )
+        .await?;
+        tracing::info!(%router_id, %share_id, "pruned router share missing from latest sync");
+    }
+    Ok(())
 }
 
 async fn sync_share_model_support(

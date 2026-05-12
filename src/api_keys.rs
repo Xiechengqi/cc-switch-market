@@ -30,6 +30,8 @@ pub struct ApiKeyItem {
     pub id: Uuid,
     pub name: String,
     pub prefix: String,
+    pub usage_tokens: i64,
+    pub usage_amount: rust_decimal::Decimal,
     pub scope_json: Option<serde_json::Value>,
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub monthly_spend_cap: Option<rust_decimal::Decimal>,
@@ -278,10 +280,25 @@ pub async fn list_api_keys(
         .db()
         .query_all(
             r#"
-        SELECT id, name, prefix, scope_json, expires_at, monthly_spend_cap, last_used_at, last_used_ip_country, created_at, revoked_at, paused_at, deleted_at
-          FROM api_keys
-         WHERE user_id = ?1 AND deleted_at IS NULL
-         ORDER BY created_at DESC
+        SELECT ak.id, ak.name, ak.prefix, ak.scope_json, ak.expires_at, ak.monthly_spend_cap,
+               ak.last_used_at, ak.last_used_ip_country, ak.created_at, ak.revoked_at,
+               ak.paused_at, ak.deleted_at,
+               COALESCE(SUM(
+                 COALESCE(CAST(json_extract(rc.usage_json, '$.input_tokens') AS INTEGER), 0) +
+                 COALESCE(CAST(json_extract(rc.usage_json, '$.output_tokens') AS INTEGER), 0) +
+                 COALESCE(CAST(json_extract(rc.usage_json, '$.cache_read_tokens') AS INTEGER), 0) +
+                 COALESCE(CAST(json_extract(rc.usage_json, '$.cache_write_tokens') AS INTEGER), 0)
+               ), 0) AS usage_tokens,
+               COALESCE(SUM(CAST(COALESCE(rc.usage_amount, rc.reserved_amount, '0') AS REAL)), 0) AS usage_amount
+          FROM api_keys ak
+          LEFT JOIN request_charges rc
+            ON rc.api_key_id = ak.id
+           AND rc.status IN ('reserved','streaming','needs_review','settled')
+         WHERE ak.user_id = ?1 AND ak.deleted_at IS NULL
+         GROUP BY ak.id, ak.name, ak.prefix, ak.scope_json, ak.expires_at, ak.monthly_spend_cap,
+                  ak.last_used_at, ak.last_used_ip_country, ak.created_at, ak.revoked_at,
+                  ak.paused_at, ak.deleted_at
+         ORDER BY ak.created_at DESC
         "#,
             vec![crate::db::uuid_val(principal.user_id)],
         )
@@ -523,10 +540,15 @@ pub async fn get_api_key_share_allowlist_endpoint(
         .db()
         .query_all(
             r#"
-            SELECT router_id, share_id
-              FROM market_api_key_share_allowlist
-             WHERE api_key_id = ?1
-             ORDER BY router_id ASC, share_id ASC
+            SELECT aks.router_id, aks.share_id
+              FROM market_api_key_share_allowlist aks
+              JOIN router_shares rs
+                ON rs.router_id = aks.router_id
+               AND rs.share_id = aks.share_id
+             WHERE aks.api_key_id = ?1
+               AND rs.for_sale = 'Yes'
+               AND rs.share_status = 'active'
+             ORDER BY aks.router_id ASC, aks.share_id ASC
             "#,
             vec![crate::db::uuid_val(id)],
         )
@@ -667,6 +689,8 @@ fn row_to_item(row: crate::db::DbRow) -> ApiKeyItem {
         id: row.uuid("id"),
         name: row.string("name"),
         prefix: row.string("prefix"),
+        usage_tokens: row.i64("usage_tokens"),
+        usage_amount: row.decimal("usage_amount"),
         scope_json: row
             .opt_string("scope_json")
             .and_then(|value| serde_json::from_str(&value).ok()),

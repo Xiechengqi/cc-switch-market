@@ -37,6 +37,8 @@ type ApiKeyItem = {
   id: string;
   name: string;
   prefix: string;
+  usage_tokens?: number | string | null;
+  usage_amount?: string | number | null;
   scope_json?: unknown;
   expires_at?: string | null;
   monthly_spend_cap?: string | null;
@@ -102,6 +104,8 @@ type MoneyEvent = {
 type UsageItem = {
   id?: string;
   request_id?: string;
+  api_key_name?: string | null;
+  api_key_prefix?: string | null;
   model?: string;
   app_type?: string;
   request_agent?: string;
@@ -619,7 +623,7 @@ function KeysTab() {
         columns={[
           { key: "name", header: c.colName, render: (r) => <span className="font-bold">{r.name}</span> },
           { key: "key", header: c.colKey, render: (r) => <ApiKeySecretCell item={r} secret={secrets?.find((secret) => secret.api_key_id === r.id)} onCopy={copyValue} /> },
-          { key: "status", header: c.colStatus, render: (r) => <Pill variant={r.paused_at ? "warning" : "success"}>{r.paused_at ? c.statusPaused : c.statusActive}</Pill> },
+          { key: "status", header: c.colStatus, render: (r) => <ApiKeyUsageStatus item={r} /> },
           { key: "limits", header: c.colLimits, render: (r) => <ApiKeyLimits item={r} /> },
           { key: "last", header: c.colLast, render: (r) => <span className="text-xs text-slate-500">{r.last_used_at ? formatDate(r.last_used_at) : c.lastNever}</span> },
           { key: "actions", header: c.colActions, render: (r) => (
@@ -936,6 +940,21 @@ function ApiKeySecretCell({ item, secret, onCopy }: { item: ApiKeyItem; secret?:
   );
 }
 
+function ApiKeyUsageStatus({ item }: { item: ApiKeyItem }) {
+  const { locale } = useLocale();
+  const c = copy[locale].dashboard.keys;
+  return (
+    <div className="grid gap-1">
+      <div className="text-xs font-bold leading-tight text-slate-600">
+        {c.usageLine(formatCompactNumber(item.usage_tokens), formatCompactMoney(item.usage_amount))}
+      </div>
+      <div>
+        <Pill variant={item.paused_at ? "warning" : "success"}>{item.paused_at ? c.statusPaused : c.statusActive}</Pill>
+      </div>
+    </div>
+  );
+}
+
 function ApiKeyLimits({ item }: { item: ApiKeyItem }) {
   const { locale } = useLocale();
   const c = copy[locale].dashboard.keys;
@@ -957,6 +976,22 @@ function apiKeyModelCount(scope: unknown): number | null {
 function trimMoney(value: string): string {
   if (!value.includes(".")) return value;
   return value.replace(/(\.\d*?[1-9])0+$/, "$1").replace(/\.0+$/, "");
+}
+
+function formatCompactNumber(value: unknown): string {
+  const numeric = typeof value === "number" ? value : Number(value ?? 0);
+  if (!Number.isFinite(numeric)) return "0";
+  return new Intl.NumberFormat("en-US", {
+    notation: "compact",
+    maximumFractionDigits: 1,
+    minimumFractionDigits: 1,
+  }).format(numeric);
+}
+
+function formatCompactMoney(value: unknown): string {
+  const numeric = typeof value === "number" ? value : Number(value ?? 0);
+  if (!Number.isFinite(numeric)) return "$0";
+  return `$${formatCompactNumber(numeric)}`;
 }
 
 function PauseKeyModal({ target, onClose, onDone }: { target: ApiKeyItem | null; onClose: () => void; onDone: () => void }) {
@@ -1204,6 +1239,7 @@ function UsageTab() {
         rowClassName={(r) => r.status === "needs_review" ? "bg-pink-50" : ""}
         columns={[
           { key: "rid", header: c.colRequest, render: (r) => <span className="font-mono text-xs break-all">{r.request_id}</span> },
+          { key: "apiKey", header: c.colApiKey, render: (r) => <span className="font-mono text-xs font-bold text-slate-700">{r.api_key_name || "-"}</span> },
           { key: "model", header: c.colModel, render: (r) => <span><span className="rounded-full bg-violet-100 border border-slate-800 px-2 py-0.5 text-xs font-bold uppercase mr-1">{r.request_agent ?? r.app_type}</span><span className="font-mono text-sm">{r.actual_model ?? r.model}</span><span className="ml-1 text-xs text-slate-500">({r.requested_model ?? r.model})</span></span> },
           { key: "share", header: c.colShare, render: (r) => r.share_subdomain ? <span className="rounded-full border border-slate-800 bg-amber-100 px-2 py-0.5 font-mono text-xs font-bold">{r.share_subdomain}</span> : <span /> },
           { key: "tokens", header: c.colTokens, render: (r) => <span className="text-xs text-slate-600">in {r.input_tokens ?? 0} · out {r.output_tokens ?? 0}</span> },

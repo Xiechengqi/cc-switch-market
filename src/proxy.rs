@@ -60,9 +60,12 @@ pub async fn usage(
                rc.reserved_amount, rc.usage_amount, rc.price_snapshot, rc.usage_json, rc.audit_flags,
                rc.request_object_key, rc.request_object_sha256,
                rc.response_meta_object_key, rc.response_meta_object_sha256,
-               rc.created_at, rc.settled_at
+               rc.created_at, rc.settled_at,
+               ak.name AS api_key_name,
+               ak.prefix AS api_key_prefix
           FROM request_charges rc
           LEFT JOIN router_shares rs ON rs.router_id = rc.router_id AND rs.share_id = rc.share_id
+          LEFT JOIN api_keys ak ON ak.id = rc.api_key_id
          WHERE rc.user_id = ?1
         "#.to_string();
     let mut params = vec![crate::db::uuid_val(principal.user_id)];
@@ -2736,6 +2739,8 @@ fn charge_json(row: crate::db::DbRow) -> serde_json::Value {
         "event_id": row.string("id"),
         "event_type": "usage_charge",
         "request_id": row.string("request_id"),
+        "api_key_name": row.opt_string("api_key_name"),
+        "api_key_prefix": row.opt_string("api_key_prefix"),
         "app_type": row.string("app_type"),
         "model": row.string("model"),
         "request_agent": row.opt_string("request_agent").unwrap_or_else(|| share_capability(&row.string("app_type")).to_string()),

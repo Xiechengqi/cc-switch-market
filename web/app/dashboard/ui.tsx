@@ -1209,6 +1209,7 @@ function UsageTab() {
   const toast = useToast();
   const [items, setItems] = useState<UsageItem[] | null>(null);
   const [reportingId, setReportingId] = useState<string | null>(null);
+  const [reportTarget, setReportTarget] = useState<UsageItem | null>(null);
   const formatDate = useDateTimeFormatter();
 
   useEffect(() => {
@@ -1254,7 +1255,7 @@ function UsageTab() {
               return (
                 <button
                   type="button"
-                  onClick={() => reportUsage(r)}
+                  onClick={() => setReportTarget(r)}
                   disabled={!canReport || reportingId === r.id}
                   className="rounded-full border-2 border-slate-800 bg-white px-3 py-1 text-xs font-bold lift disabled:opacity-40"
                 >
@@ -1272,6 +1273,40 @@ function UsageTab() {
           </div>
         )}
       />
+      <Modal
+        open={!!reportTarget}
+        onClose={() => setReportTarget(null)}
+        title={c.reportConfirmTitle}
+        description={c.reportConfirmBody}
+        footer={
+          <ModalActions>
+            <button
+              type="button"
+              onClick={() => setReportTarget(null)}
+              className="rounded-full border-2 border-slate-800 bg-white px-4 py-2 text-sm font-bold lift"
+            >
+              {c.reportCancel}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                const row = reportTarget;
+                setReportTarget(null);
+                if (row) void reportUsage(row);
+              }}
+              disabled={!!reportingId}
+              className="rounded-full border-2 border-slate-800 bg-pink-500 px-4 py-2 text-sm font-bold text-white lift disabled:opacity-50"
+            >
+              {c.reportConfirm}
+            </button>
+          </ModalActions>
+        }
+      >
+        <div className="grid gap-2 rounded-2xl border-2 border-slate-800 bg-amber-50 p-4 text-sm">
+          <div className="font-mono text-xs break-all">{reportTarget?.request_id ?? "-"}</div>
+          <div className="text-slate-600">{c.colAmount}: ${reportTarget?.gross_amount ?? reportTarget?.usage_amount ?? reportTarget?.reserved_amount ?? "0"}</div>
+        </div>
+      </Modal>
     </div>
   );
 }

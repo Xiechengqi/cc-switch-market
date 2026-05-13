@@ -869,7 +869,12 @@ function SharesTab() {
         rowKey={(r, i) => String(r.share_id ?? i)}
         empty={<EmptyState shape="circle" title="暂无 share 缓存" hint="点击「同步 Router Shares」从 router 拉取" />}
         columns={[
-          { key: "share", header: "Share", render: (r) => <span className="font-mono text-xs break-all">{String(r.share_id ?? "")}</span> },
+          { key: "share", header: "Share", render: (r) => (
+            <div className="grid gap-1">
+              <span className="font-mono text-xs break-all">{String(r.share_id ?? "")}</span>
+              <span className="font-mono text-xs font-bold text-slate-500 break-all">{String(r.subdomain ?? "") || "-"}</span>
+            </div>
+          ) },
           { key: "owner", header: "Owner", render: (r) => <span className="font-mono text-sm">{String(r.owner_email ?? r.installation_owner_email ?? "")}</span> },
           { key: "app", header: "类型", render: (r) => <span className="rounded-full bg-violet-100 border-2 border-slate-800 px-2 py-0.5 text-xs font-bold uppercase">{String(r.app_type ?? "")}</span> },
           { key: "support", header: "Client 支持", render: (r) => <ShareCapabilityBadges row={r} mode="support" /> },

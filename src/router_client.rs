@@ -95,6 +95,7 @@ pub async fn sync_shares(state: &AppState) -> Result<usize, ApiError> {
     }
     let shares: Vec<serde_json::Value> = response.json().await.unwrap_or_default();
     let db = state.db();
+    let tx = db.begin_immediate().await?;
     let mut count = 0;
     let mut seen = HashSet::new();
     let mut had_invalid_share = false;
@@ -123,7 +124,7 @@ pub async fn sync_shares(state: &AppState) -> Result<usize, ApiError> {
             .app_type
             .clone()
             .unwrap_or_else(|| "openai".to_string());
-        db.execute(
+        tx.execute(
             r#"
             INSERT INTO router_shares
               (router_id, share_id, subdomain, installation_id, owner_email, installation_owner_email, app_type, for_sale, share_status, online, active_requests, parallel_limit, online_rate_24h, enabled_claude, enabled_codex, enabled_gemini, raw_json, last_seen_at, last_success_at)
@@ -168,20 +169,21 @@ pub async fn sync_shares(state: &AppState) -> Result<usize, ApiError> {
             ],
         )
         .await?;
-        sync_share_model_support(db, &router_id, &share.share_id, &share.app_runtimes).await?;
+        sync_share_model_support(&tx, &router_id, &share.share_id, &share.app_runtimes).await?;
         count += 1;
     }
     if !had_invalid_share {
-        prune_missing_router_shares(db, &seen).await?;
+        prune_missing_router_shares(&tx, &seen).await?;
     }
+    tx.commit().await?;
     Ok(count)
 }
 
 async fn prune_missing_router_shares(
-    db: &crate::db::Db,
+    tx: &crate::db::DbTx,
     seen: &HashSet<(String, String)>,
 ) -> Result<(), ApiError> {
-    let rows = db
+    let rows = tx
         .query_all("SELECT router_id, share_id FROM router_shares", vec![])
         .await?;
     for row in rows {
@@ -190,12 +192,12 @@ async fn prune_missing_router_shares(
         if seen.contains(&(router_id.clone(), share_id.clone())) {
             continue;
         }
-        db.execute(
+        tx.execute(
             "DELETE FROM router_share_model_support WHERE router_id=?1 AND share_id=?2",
             vec![crate::db::val(&router_id), crate::db::val(&share_id)],
         )
         .await?;
-        db.execute(
+        tx.execute(
             "DELETE FROM router_shares WHERE router_id=?1 AND share_id=?2",
             vec![crate::db::val(&router_id), crate::db::val(&share_id)],
         )
@@ -206,12 +208,12 @@ async fn prune_missing_router_shares(
 }
 
 async fn sync_share_model_support(
-    db: &crate::db::Db,
+    tx: &crate::db::DbTx,
     router_id: &str,
     share_id: &str,
     app_runtimes: &ShareAppRuntimes,
 ) -> Result<(), ApiError> {
-    db.execute(
+    tx.execute(
         "DELETE FROM router_share_model_support WHERE router_id=?1 AND share_id=?2",
         vec![crate::db::val(router_id), crate::db::val(share_id)],
     )
@@ -227,7 +229,7 @@ async fn sync_share_model_support(
         };
         let official = runtime.kind == "official_oauth";
         if official {
-            db.execute(
+            tx.execute(
                 r#"
                 INSERT OR REPLACE INTO router_share_model_support
                   (router_id, share_id, app, slot, actual_model, official, api_url, provider_kind, updated_at)
@@ -251,7 +253,7 @@ async fn sync_share_model_support(
             if slot.is_empty() || actual_model.is_empty() {
                 continue;
             }
-            db.execute(
+            tx.execute(
                 r#"
                 INSERT OR REPLACE INTO router_share_model_support
                   (router_id, share_id, app, slot, actual_model, official, api_url, provider_kind, updated_at)

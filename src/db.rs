@@ -3,7 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex as StdMutex},
 };
 
 use anyhow::Context;
@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use libsql::{Builder, Connection, Database, Row, Transaction, TransactionBehavior, Value};
 use rust_decimal::Decimal;
 use serde_json::Value as JsonValue;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -19,7 +20,8 @@ use crate::config::Config;
 pub struct Db {
     database: Arc<Database>,
     mode: DbMode,
-    last_backup_at: Arc<Mutex<Option<DateTime<Utc>>>>,
+    write_lock: Arc<AsyncMutex<()>>,
+    last_backup_at: Arc<StdMutex<Option<DateTime<Utc>>>>,
 }
 
 #[derive(Clone)]
@@ -30,6 +32,7 @@ pub enum DbMode {
 
 pub struct DbTx {
     tx: Transaction,
+    _write_guard: OwnedMutexGuard<()>,
 }
 
 #[derive(Clone, Debug)]
@@ -55,7 +58,8 @@ pub async fn connect(config: &Config) -> anyhow::Result<Db> {
                 url: url.clone(),
                 replica_path: config.turso_replica_path.clone(),
             },
-            last_backup_at: Arc::new(Mutex::new(None)),
+            write_lock: Arc::new(AsyncMutex::new(())),
+            last_backup_at: Arc::new(StdMutex::new(None)),
         });
     }
 
@@ -63,13 +67,16 @@ pub async fn connect(config: &Config) -> anyhow::Result<Db> {
     let database = Builder::new_local(&config.market_sqlite_path)
         .build()
         .await?;
-    Ok(Db {
+    let db = Db {
         database: Arc::new(database),
         mode: DbMode::Local {
             path: config.market_sqlite_path.clone(),
         },
-        last_backup_at: Arc::new(Mutex::new(None)),
-    })
+        write_lock: Arc::new(AsyncMutex::new(())),
+        last_backup_at: Arc::new(StdMutex::new(None)),
+    };
+    db.configure_local_connection().await?;
+    Ok(db)
 }
 
 pub async fn migrate(db: &Db) -> anyhow::Result<()> {
@@ -397,13 +404,38 @@ impl Db {
         self.database.connect()
     }
 
+    async fn configured_conn(&self) -> Result<Connection, libsql::Error> {
+        let conn = self.conn()?;
+        if matches!(self.mode, DbMode::Local { .. }) {
+            conn.execute_batch("PRAGMA busy_timeout = 5000;").await?;
+        }
+        Ok(conn)
+    }
+
+    async fn configure_local_connection(&self) -> Result<(), libsql::Error> {
+        if matches!(self.mode, DbMode::Local { .. }) {
+            let conn = self.conn()?;
+            conn.execute_batch(
+                r#"
+                PRAGMA journal_mode = WAL;
+                PRAGMA busy_timeout = 5000;
+                PRAGMA foreign_keys = ON;
+                "#,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     pub async fn execute_batch(&self, sql: &str) -> Result<(), libsql::Error> {
-        self.conn()?.execute_batch(sql).await?;
+        let _guard = self.write_lock.lock().await;
+        self.configured_conn().await?.execute_batch(sql).await?;
         Ok(())
     }
 
     pub async fn execute(&self, sql: &str, params: Vec<Value>) -> Result<u64, libsql::Error> {
-        self.conn()?.execute(sql, params).await
+        let _guard = self.write_lock.lock().await;
+        self.configured_conn().await?.execute(sql, params).await
     }
 
     pub async fn query_all(
@@ -411,7 +443,7 @@ impl Db {
         sql: &str,
         params: Vec<Value>,
     ) -> Result<Vec<DbRow>, libsql::Error> {
-        rows_to_vec(self.conn()?.query(sql, params).await?).await
+        rows_to_vec(self.configured_conn().await?.query(sql, params).await?).await
     }
 
     pub async fn query_optional(
@@ -419,7 +451,7 @@ impl Db {
         sql: &str,
         params: Vec<Value>,
     ) -> Result<Option<DbRow>, libsql::Error> {
-        let mut rows = self.conn()?.query(sql, params).await?;
+        let mut rows = self.configured_conn().await?.query(sql, params).await?;
         rows.next().await?.map(row_to_map).transpose()
     }
 
@@ -430,11 +462,13 @@ impl Db {
     }
 
     pub async fn begin_immediate(&self) -> Result<DbTx, libsql::Error> {
+        let write_guard = self.write_lock.clone().lock_owned().await;
+        let conn = self.configured_conn().await?;
         Ok(DbTx {
-            tx: self
-                .conn()?
+            tx: conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .await?,
+            _write_guard: write_guard,
         })
     }
 }
@@ -442,6 +476,14 @@ impl Db {
 impl DbTx {
     pub async fn execute(&self, sql: &str, params: Vec<Value>) -> Result<u64, libsql::Error> {
         self.tx.execute(sql, params).await
+    }
+
+    pub async fn query_all(
+        &self,
+        sql: &str,
+        params: Vec<Value>,
+    ) -> Result<Vec<DbRow>, libsql::Error> {
+        rows_to_vec(self.tx.query(sql, params).await?).await
     }
 
     pub async fn query_optional(

@@ -22,6 +22,7 @@ use crate::{
 
 const FIRST_TOPUP_MAX_USD: i64 = 10;
 const FIRST_TOPUP_LIMIT_MESSAGE: &str = "首冲最多 10$，建议先小额体验后再充值更多";
+const TOPUP_ORDER_TTL_MINUTES: i64 = 30;
 
 #[derive(Deserialize)]
 pub struct CheckoutRequest {
@@ -98,7 +99,7 @@ pub async fn create_checkout(
     }
     let id = Uuid::new_v4();
     let now = crate::db::now_string();
-    let expires_at = (Utc::now() + Duration::hours(24)).to_rfc3339();
+    let expires_at = topup_order_expires_at(Utc::now());
     let (checkout_url, provider_payment_id) =
         create_dodo_checkout_url(&state, id, principal.user_id, input.amount_usd, net, fee).await?;
     db.execute(
@@ -149,6 +150,10 @@ async fn enforce_first_topup_limit(
         ));
     }
     Ok(())
+}
+
+fn topup_order_expires_at(now: chrono::DateTime<Utc>) -> String {
+    (now + Duration::minutes(TOPUP_ORDER_TTL_MINUTES)).to_rfc3339()
 }
 
 fn first_topup_exceeds_limit(amount: Decimal, paid_topup_count: i64) -> bool {
@@ -718,7 +723,11 @@ fn hmac_sha256(secret: Vec<u8>, payload: &[u8]) -> Result<Vec<u8>, ApiError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FIRST_TOPUP_LIMIT_MESSAGE, FIRST_TOPUP_MAX_USD, first_topup_exceeds_limit};
+    use super::{
+        FIRST_TOPUP_LIMIT_MESSAGE, FIRST_TOPUP_MAX_USD, TOPUP_ORDER_TTL_MINUTES,
+        first_topup_exceeds_limit, topup_order_expires_at,
+    };
+    use chrono::{TimeZone, Utc};
     use rust_decimal::Decimal;
 
     #[test]
@@ -736,6 +745,13 @@ mod tests {
         assert!(!first_topup_exceeds_limit(Decimal::new(1000, 2), 0));
         assert!(first_topup_exceeds_limit(Decimal::new(1001, 2), 0));
         assert!(!first_topup_exceeds_limit(Decimal::new(1001, 2), 1));
+    }
+
+    #[test]
+    fn topup_order_expiry_is_thirty_minutes() {
+        assert_eq!(TOPUP_ORDER_TTL_MINUTES, 30);
+        let now = Utc.with_ymd_and_hms(2026, 5, 14, 1, 0, 0).unwrap();
+        assert_eq!(topup_order_expires_at(now), "2026-05-14T01:30:00+00:00");
     }
 }
 

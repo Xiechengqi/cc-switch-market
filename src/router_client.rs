@@ -67,6 +67,10 @@ pub struct RouterShare {
     pub parallel_limit: Option<i32>,
     pub online_rate_24h: Option<rust_decimal::Decimal>,
     #[serde(default)]
+    pub disabled_by_market: bool,
+    #[serde(default)]
+    pub market_disabled_at: Option<String>,
+    #[serde(default)]
     pub support: ShareSupport,
     #[serde(default)]
     pub app_runtimes: ShareAppRuntimes,
@@ -127,8 +131,8 @@ pub async fn sync_shares(state: &AppState) -> Result<usize, ApiError> {
         tx.execute(
             r#"
             INSERT INTO router_shares
-              (router_id, share_id, subdomain, installation_id, owner_email, installation_owner_email, app_type, for_sale, share_status, online, active_requests, parallel_limit, online_rate_24h, enabled_claude, enabled_codex, enabled_gemini, raw_json, last_seen_at, last_success_at)
-            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?18)
+              (router_id, share_id, subdomain, installation_id, owner_email, installation_owner_email, app_type, for_sale, share_status, online, active_requests, parallel_limit, online_rate_24h, enabled_claude, enabled_codex, enabled_gemini, disabled_by_market, market_disabled_at, raw_json, last_seen_at, last_success_at)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?20)
             ON CONFLICT (router_id, share_id) DO UPDATE SET
               subdomain = excluded.subdomain,
               installation_id = excluded.installation_id,
@@ -144,8 +148,10 @@ pub async fn sync_shares(state: &AppState) -> Result<usize, ApiError> {
               enabled_claude = excluded.enabled_claude,
               enabled_codex = excluded.enabled_codex,
               enabled_gemini = excluded.enabled_gemini,
+              disabled_by_market = excluded.disabled_by_market,
+              market_disabled_at = excluded.market_disabled_at,
               raw_json = excluded.raw_json,
-              last_seen_at = ?18
+              last_seen_at = ?20
             "#,
             vec![
                 crate::db::val(&router_id),
@@ -164,6 +170,8 @@ pub async fn sync_shares(state: &AppState) -> Result<usize, ApiError> {
                 crate::db::val(share.support.claude),
                 crate::db::val(share.support.codex),
                 crate::db::val(share.support.gemini),
+                crate::db::val(share.disabled_by_market),
+                crate::db::opt_val(share.market_disabled_at.clone()),
                 crate::db::json_val(raw_share),
                 crate::db::val(crate::db::now_string()),
             ],

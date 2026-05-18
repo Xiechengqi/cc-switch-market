@@ -495,7 +495,7 @@ pub async fn available_shares_endpoint(
                    COALESCE(NULLIF(subdomain, ''), json_extract(raw_json, '$.subdomain')) AS subdomain,
                    app_type, enabled_codex, enabled_claude, enabled_gemini, online, for_sale, share_status
               FROM router_shares
-             WHERE for_sale = 'Yes' AND share_status = 'active'
+             WHERE for_sale = 'Yes' AND share_status = 'active' AND COALESCE(disabled_by_market, 0) = 0
              ORDER BY online DESC, COALESCE(NULLIF(subdomain, ''), json_extract(raw_json, '$.subdomain')) ASC, router_id ASC, share_id ASC
             "#,
             vec![],
@@ -548,6 +548,7 @@ pub async fn get_api_key_share_allowlist_endpoint(
              WHERE aks.api_key_id = ?1
                AND rs.for_sale = 'Yes'
                AND rs.share_status = 'active'
+               AND COALESCE(rs.disabled_by_market, 0) = 0
              ORDER BY aks.router_id ASC, aks.share_id ASC
             "#,
             vec![crate::db::uuid_val(id)],
@@ -591,7 +592,7 @@ pub async fn set_api_key_share_allowlist_endpoint(
         let exists = state
             .db()
             .query_optional(
-                "SELECT 1 AS found FROM router_shares WHERE router_id=?1 AND share_id=?2 AND for_sale='Yes' AND share_status='active' LIMIT 1",
+                "SELECT 1 AS found FROM router_shares WHERE router_id=?1 AND share_id=?2 AND for_sale='Yes' AND share_status='active' AND COALESCE(disabled_by_market, 0) = 0 LIMIT 1",
                 vec![crate::db::val(&share.router_id), crate::db::val(&share.share_id)],
             )
             .await?;

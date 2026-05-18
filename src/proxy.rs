@@ -2246,6 +2246,7 @@ async fn select_share_candidates(
                 OR (?10 = 1 AND enabled_claude = 1)
                 OR (?11 = 1 AND enabled_gemini = 1))
            AND online = 1 AND share_status = 'active' AND for_sale = 'Yes'
+           AND COALESCE(disabled_by_market, 0) = 0
            AND (parallel_limit = -1 OR active_requests < parallel_limit)
            AND COALESCE(owner_email, installation_owner_email) IS NOT NULL
            AND (cooldown_until IS NULL OR cooldown_until < ?2)
@@ -2357,6 +2358,33 @@ async fn select_share_candidates(
         });
     }
     if shares.is_empty() {
+        let disabled_count = db
+            .query_one(
+                r#"
+                SELECT COUNT(*) AS count
+                  FROM router_shares
+                 WHERE (app_type IN (?1, ?2)
+                        OR (?3 = 1 AND enabled_codex = 1)
+                        OR (?4 = 1 AND enabled_claude = 1)
+                        OR (?5 = 1 AND enabled_gemini = 1))
+                   AND online = 1 AND share_status = 'active' AND for_sale = 'Yes'
+                   AND COALESCE(disabled_by_market, 0) = 1
+                "#,
+                vec![
+                    crate::db::val(app_type),
+                    crate::db::val(app_type_alias),
+                    crate::db::val(support.codex),
+                    crate::db::val(support.claude),
+                    crate::db::val(support.gemini),
+                ],
+            )
+            .await?
+            .i64("count");
+        if disabled_count > 0 {
+            return Err(ApiError::service_unavailable(format!(
+                "all linked router shares are disabled by this market, app_type={app_type}, model={model}"
+            )));
+        }
         if allowlist_count > 0 {
             Err(ApiError::service_unavailable(format!(
                 "no available router share for this API key allowlist, app_type={app_type}, model={model}"

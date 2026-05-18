@@ -253,7 +253,7 @@ pub async fn metrics(State(state): State<AppState>) -> Json<Metrics> {
         count(state.db(), "SELECT COUNT(*) AS count FROM router_shares").await;
     let routeable_shares = count(
         state.db(),
-        "SELECT COUNT(*) AS count FROM router_shares WHERE online=1 AND share_status='active' AND for_sale='Yes'",
+        "SELECT COUNT(*) AS count FROM router_shares WHERE online=1 AND share_status='active' AND for_sale='Yes' AND COALESCE(disabled_by_market, 0) = 0",
     )
     .await;
     let share_success_events = count(

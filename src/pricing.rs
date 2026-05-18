@@ -941,6 +941,7 @@ async fn model_item_from_row(
                 OR (?4 = 1 AND enabled_claude = 1)
                 OR (?5 = 1 AND enabled_gemini = 1))
            AND online=1 AND share_status='active' AND for_sale='Yes'
+           AND COALESCE(disabled_by_market, 0) = 0
         "#,
             vec![
                 crate::db::val(&row_app_type),
@@ -1227,6 +1228,7 @@ pub async fn route_candidates(
                 OR (?5 = 1 AND enabled_claude = 1)
                 OR (?6 = 1 AND enabled_gemini = 1))
            AND online=1 AND share_status='active' AND for_sale='Yes'
+           AND COALESCE(disabled_by_market, 0) = 0
            AND (parallel_limit = -1 OR active_requests < parallel_limit)
            AND COALESCE(owner_email, installation_owner_email) IS NOT NULL
            AND (last_error_at IS NULL OR last_error_at < ?2)

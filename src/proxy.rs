@@ -1578,6 +1578,7 @@ async fn forward_non_stream_with_retries(
                 .await;
                 clear_sticky_route_for_share(state, sticky_key, share).await;
                 maybe_block_model_share(state, model_id, share, kind, &message).await;
+                maybe_report_router_feedback(state, share, kind).await;
                 let retryable = is_retryable_failure(kind);
                 last_err = Some(err);
                 if !retryable {
@@ -1879,6 +1880,7 @@ async fn forward_stream_with_retries(
                 .await;
                 clear_sticky_route_for_share(state, sticky_key, share).await;
                 maybe_block_model_share(state, model_id, share, kind, &message).await;
+                maybe_report_router_feedback(state, share, kind).await;
                 let retryable = is_retryable_failure(kind);
                 last_err = Some(err);
                 if !retryable {
@@ -2035,6 +2037,16 @@ fn is_retryable_failure(kind: &str) -> bool {
         kind,
         "timeout" | "rate_limited" | "upstream_unavailable" | "network"
     )
+}
+
+/// Forward a `rate_limited` classification to the router so it down-ranks
+/// every share of the same owner. No-op for other failure kinds; the router
+/// handles auth/model errors on its own (cooldown via `failure_count`) and we
+/// don't want a one-off network blip to penalize an entire owner.
+async fn maybe_report_router_feedback(state: &AppState, share: &SelectedShare, kind: &str) {
+    if kind == "rate_limited" {
+        crate::router_client::report_rate_limited(state, &share.router_id, &share.share_id).await;
+    }
 }
 
 async fn maybe_block_model_share(
@@ -2197,6 +2209,8 @@ async fn select_share_candidates(
     model: &str,
     limit: i64,
 ) -> Result<Vec<SelectedShare>, ApiError> {
+    let profile = crate::scheduling::resolve_profile(api.scope_json.as_ref());
+    let weights = profile.weights();
     let app_type_alias = share_app_type_alias(app_type);
     let support = share_support_flags(app_type);
     let capability = share_capability(app_type);
@@ -2283,7 +2297,28 @@ async fn select_share_candidates(
                 WHERE mrs.rule_id = ?3 AND mrs.router_id = router_shares.router_id AND mrs.share_id = router_shares.share_id
              ))
            )
-         ORDER BY active_requests ASC, priority DESC, CAST(online_rate_24h AS REAL) DESC, COALESCE(last_success_at, last_seen_at) DESC
+         -- Base score: combines router-computed signals so a single ORDER BY
+         -- replaces the older multi-key tiebreaker. Weights come from the
+         -- caller's SchedulingProfile (?15-?18); ?19 (price_bias) shifts the
+         -- score for cost-leaning profiles. owner_penalty here is the column
+         -- on router_shares — a 429 from one share down-ranks every share of
+         -- the same owner. failure_count subtracts a small linear penalty so
+         -- a chronically-flaky share drops below healthy peers without being
+         -- filtered out entirely.
+         ORDER BY
+           (
+             (?15 * stability
+              + ?16 * quota_health
+              + ?17 * CASE WHEN parallel_limit = -1 THEN 1.0
+                           ELSE 1.0 - (CAST(active_requests AS REAL) / CAST(parallel_limit AS REAL))
+                      END
+              + ?18 * 1.0)
+             * (1.0 + ?19 * 0.5)
+             * owner_penalty
+             - 0.05 * MIN(failure_count, 5)
+           ) DESC,
+           priority DESC,
+           COALESCE(last_success_at, last_seen_at) DESC
          LIMIT ?7
         "#,
         vec![
@@ -2301,6 +2336,11 @@ async fn select_share_candidates(
             crate::db::val(capability),
             crate::db::val(allowlist_count),
             crate::db::uuid_val(api.api_key_id),
+            crate::db::val(weights.stability),
+            crate::db::val(weights.quota_health),
+            crate::db::val(weights.headroom),
+            crate::db::val(weights.freshness),
+            crate::db::val(weights.price_bias),
         ],
     )
     .await?;

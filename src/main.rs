@@ -22,6 +22,7 @@ mod router_account;
 mod router_client;
 mod router_notifications;
 mod router_request_logs;
+mod scheduling;
 mod static_assets;
 mod support;
 mod topups;

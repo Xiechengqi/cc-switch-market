@@ -111,6 +111,15 @@ async fn additive_migrations(db: &Db) -> anyhow::Result<()> {
         "ALTER TABLE router_shares ADD COLUMN enabled_gemini INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE router_shares ADD COLUMN disabled_by_market INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE router_shares ADD COLUMN market_disabled_at TEXT",
+        // Router-computed scheduling signals; refreshed every share sync.
+        // Defaults are intentionally generous (1.0 / 0.5) so a freshly-migrated
+        // row doesn't get punished before the first sync overwrites them.
+        "ALTER TABLE router_shares ADD COLUMN quota_health REAL NOT NULL DEFAULT 0.5",
+        "ALTER TABLE router_shares ADD COLUMN stability REAL NOT NULL DEFAULT 1.0",
+        "ALTER TABLE router_shares ADD COLUMN headroom REAL NOT NULL DEFAULT 1.0",
+        "ALTER TABLE router_shares ADD COLUMN samples_10m INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE router_shares ADD COLUMN owner_penalty REAL NOT NULL DEFAULT 1.0",
+        "ALTER TABLE router_shares ADD COLUMN share_created_at TEXT",
         "ALTER TABLE api_keys ADD COLUMN paused_at TEXT",
         "ALTER TABLE api_keys ADD COLUMN deleted_at TEXT",
         "ALTER TABLE market_share_sticky_routes ADD COLUMN api_key_id TEXT",
@@ -661,6 +670,12 @@ impl IntoDbValue for u64 {
 impl IntoDbValue for bool {
     fn into_db_value(self) -> Value {
         Value::Integer(i64::from(self))
+    }
+}
+
+impl IntoDbValue for f64 {
+    fn into_db_value(self) -> Value {
+        Value::Real(self)
     }
 }
 

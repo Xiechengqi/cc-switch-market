@@ -85,6 +85,7 @@ type ApiKeyLimitFormValue = {
   spendMode: "unlimited" | "custom";
   monthlySpendCap: string;
   selectedVendorKeys: string[];
+  schedulingProfile: string;
 };
 type MoneyEvent = {
   id?: string;
@@ -166,6 +167,16 @@ const AGENT_MODEL_VENDOR_OPTIONS = [
   },
 ] as const;
 const DEFAULT_AGENT_VENDOR_KEYS = ["claude:anthropic", "codex:openai", "gemini:gemini"];
+const SCHEDULING_PROFILE_OPTIONS = [
+  "balanced",
+  "price-first",
+  "stability-first",
+  "fresh-quota",
+  "diversify",
+  "premium",
+  "budget-aware",
+] as const;
+const DEFAULT_SCHEDULING_PROFILE = "balanced";
 
 function ConsoleDataTable<T>(props: DataTableProps<T>) {
   const { locale } = useLocale();
@@ -800,6 +811,19 @@ function ApiKeyLimitFields({ value, onChange, prices }: { value: ApiKeyLimitForm
       <div className="rounded-3xl border-2 border-slate-800 bg-white p-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
+            <div className="font-bold">{c.schedulingLabel}</div>
+            <div className="text-xs text-slate-500">{c.schedulingHint}</div>
+          </div>
+          <select value={value.schedulingProfile} onChange={(e) => patch({ schedulingProfile: e.target.value })} className="rounded-2xl border-2 border-slate-800 bg-amber-50 px-3 py-2 font-bold">
+            {SCHEDULING_PROFILE_OPTIONS.map((profile) => (
+              <option key={profile} value={profile}>{c.schedulingProfiles[profile] ?? profile}</option>
+            ))}
+          </select>
+        </div>
+      </div>
+      <div className="rounded-3xl border-2 border-slate-800 bg-white p-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
             <div className="font-bold">{c.modelScopeLabel}</div>
             <div className="text-xs text-slate-500">{c.modelScopeHint}</div>
           </div>
@@ -836,6 +860,7 @@ function emptyLimitForm(): ApiKeyLimitFormValue {
     spendMode: "unlimited",
     monthlySpendCap: "",
     selectedVendorKeys: DEFAULT_AGENT_VENDOR_KEYS,
+    schedulingProfile: DEFAULT_SCHEDULING_PROFILE,
   };
 }
 
@@ -847,6 +872,7 @@ function limitFormFromApiKey(item: ApiKeyItem): ApiKeyLimitFormValue {
     spendMode: item.monthly_spend_cap ? "custom" : "unlimited",
     monthlySpendCap: item.monthly_spend_cap ? trimMoney(item.monthly_spend_cap) : "",
     selectedVendorKeys: vendorKeys ?? DEFAULT_AGENT_VENDOR_KEYS,
+    schedulingProfile: apiKeySchedulingProfile(item.scope_json) ?? DEFAULT_SCHEDULING_PROFILE,
   };
 }
 
@@ -854,7 +880,10 @@ function buildLimitPayload(value: ApiKeyLimitFormValue): Record<string, unknown>
   return {
     expires_at: value.expiresMode === "custom" ? new Date(value.expiresAt).toISOString() : null,
     monthly_spend_cap: value.spendMode === "custom" ? value.monthlySpendCap : null,
-    scope_json: { agent_model_vendors: agentModelVendorsFromKeys(value.selectedVendorKeys) },
+    scope_json: {
+      agent_model_vendors: agentModelVendorsFromKeys(value.selectedVendorKeys),
+      schedulingProfile: value.schedulingProfile,
+    },
   };
 }
 
@@ -886,6 +915,15 @@ function apiKeyModelKeys(scope: unknown): string[] | null {
     }
   }
   return keys.length ? keys : null;
+}
+
+function apiKeySchedulingProfile(scope: unknown): string | null {
+  if (!scope || typeof scope !== "object") return null;
+  const raw = (scope as { schedulingProfile?: unknown; scheduling_profile?: unknown }).schedulingProfile
+    ?? (scope as { scheduling_profile?: unknown }).scheduling_profile;
+  if (typeof raw !== "string") return null;
+  const value = raw.toLowerCase().replace(/_/g, "-");
+  return (SCHEDULING_PROFILE_OPTIONS as readonly string[]).includes(value) ? value : null;
 }
 
 function apiKeyVendorKeys(scope: unknown): string[] | null {
@@ -959,12 +997,14 @@ function ApiKeyLimits({ item }: { item: ApiKeyItem }) {
   const { locale } = useLocale();
   const c = copy[locale].dashboard.keys;
   const modelCount = apiKeyModelCount(item.scope_json);
+  const profile = apiKeySchedulingProfile(item.scope_json) ?? DEFAULT_SCHEDULING_PROFILE;
   const formatDate = useDateTimeFormatter();
   return (
     <div className="grid gap-1 text-xs text-slate-600">
       <span>{c.limitExpires}: {item.expires_at ? formatDate(item.expires_at) : c.unlimited}</span>
       <span>{c.limitSpend}: {item.monthly_spend_cap ? `$${trimMoney(item.monthly_spend_cap)}` : c.unlimited}</span>
       <span>{c.limitModels}: {modelCount === null ? c.unlimited : c.modelCount(modelCount)}</span>
+      <span>{c.limitScheduling}: {c.schedulingProfiles[profile] ?? profile}</span>
     </div>
   );
 }

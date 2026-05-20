@@ -775,7 +775,9 @@ async fn parse_router_response<T: for<'de> Deserialize<'de>>(
 #[derive(Debug, Clone)]
 pub struct ApiKeyPrincipal {
     pub user_id: Uuid,
+    pub user_email: String,
     pub api_key_id: Uuid,
+    pub is_admin: bool,
     pub monthly_spend_cap: Option<rust_decimal::Decimal>,
     pub scope_json: Option<serde_json::Value>,
 }

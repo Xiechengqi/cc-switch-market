@@ -127,9 +127,10 @@ async fn main() -> anyhow::Result<()> {
     );
     let state = AppState::new(config.clone()).await?;
     let pricing_summary = pricing::pricing_summary(state.db()).await.ok();
-    let session = router_account::register_market(&config, pricing_summary).await.with_context(|| {
+    let (session, market_registration) = router_account::register_market(&config, pricing_summary).await.with_context(|| {
         "router market registration failed. Run `cc-switch-market login` first and verify ROUTER_BASE_DOMAIN/ROUTER_MARKET_SUBDOMAIN"
     })?;
+    update_market_runtime_from_registration(&state, &market_registration).await;
     tracing::info!(
         market_email = %session.email,
         public_base_url = %config.market_public_base_url,
@@ -158,16 +159,30 @@ async fn main() -> anyhow::Result<()> {
 
 fn spawn_market_pricing_sync(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             interval.tick().await;
             let pricing_summary = pricing::pricing_summary(state.db()).await.ok();
-            if let Err(err) = router_account::register_market(&state.config, pricing_summary).await
-            {
-                tracing::warn!(error = %err, "sync market pricing summary to router failed");
+            match router_account::register_market(&state.config, pricing_summary).await {
+                Ok((_session, registration)) => {
+                    update_market_runtime_from_registration(&state, &registration).await;
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "sync market pricing summary to router failed");
+                }
             }
         }
     })
+}
+
+async fn update_market_runtime_from_registration(
+    state: &AppState,
+    registration: &router_account::MarketRegistration,
+) {
+    let mut runtime = state.market_runtime.write().await;
+    runtime.owner_email = Some(registration.email.trim().to_ascii_lowercase());
+    runtime.maintenance_enabled = registration.maintenance_enabled;
+    runtime.maintenance_message = registration.maintenance_message.clone();
 }
 
 fn print_help() {

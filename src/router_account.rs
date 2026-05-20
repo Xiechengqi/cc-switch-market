@@ -82,6 +82,16 @@ struct SessionResponse {
     refresh_expires_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketRegistration {
+    pub email: String,
+    #[serde(default)]
+    pub maintenance_enabled: bool,
+    #[serde(default)]
+    pub maintenance_message: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ErrorResponse {
     message: String,
@@ -202,7 +212,7 @@ pub async fn refresh_session(config: &Config) -> anyhow::Result<RouterSession> {
 pub async fn register_market(
     config: &Config,
     pricing_summary: Option<serde_json::Value>,
-) -> anyhow::Result<RouterSession> {
+) -> anyhow::Result<(RouterSession, MarketRegistration)> {
     let session = refresh_session(config).await?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
@@ -222,8 +232,8 @@ pub async fn register_market(
         .send()
         .await
         .context("register market with router failed")?;
-    let _: serde_json::Value = parse_json_response(response).await?;
-    Ok(session)
+    let market: MarketRegistration = parse_json_response(response).await?;
+    Ok((session, market))
 }
 
 fn normalize_email(value: &str) -> anyhow::Result<String> {

@@ -216,6 +216,7 @@ async fn handle_llm_request_with_model(
     model_override: Option<String>,
 ) -> Result<Response, ApiError> {
     let api = api_key_from_headers(&meta.headers, &state).await?;
+    enforce_market_maintenance(&state, &api).await?;
     let db = state.db();
     ledger::ensure_user_accounts(db, api.user_id).await?;
     ledger::ensure_platform_accounts(db).await?;
@@ -2110,7 +2111,12 @@ async fn api_key_from_headers(
            AND paused_at IS NULL
            AND deleted_at IS NULL
            AND (expires_at IS NULL OR expires_at > ?2)
-         RETURNING id, user_id, monthly_spend_cap, scope_json
+         RETURNING
+            id,
+            user_id,
+            (SELECT email FROM users WHERE users.id = api_keys.user_id) AS user_email,
+            monthly_spend_cap,
+            scope_json
         "#,
             vec![
                 crate::db::val(hash),
@@ -2126,10 +2132,45 @@ async fn api_key_from_headers(
     Ok(ApiKeyPrincipal {
         api_key_id: row.uuid("id"),
         user_id: row.uuid("user_id"),
+        user_email: row.string("user_email"),
+        is_admin: state
+            .config
+            .market_admin_emails
+            .iter()
+            .any(|email| email.eq_ignore_ascii_case(&row.string("user_email"))),
         monthly_spend_cap: row.opt_decimal("monthly_spend_cap"),
         scope_json: row
             .opt_string("scope_json")
             .and_then(|value| serde_json::from_str(&value).ok()),
+    })
+}
+
+async fn enforce_market_maintenance(
+    state: &AppState,
+    api: &ApiKeyPrincipal,
+) -> Result<(), ApiError> {
+    let runtime = state.market_runtime.read().await.clone();
+    if !runtime.maintenance_enabled {
+        return Ok(());
+    }
+    let is_owner = runtime
+        .owner_email
+        .as_deref()
+        .map(|owner| owner.eq_ignore_ascii_case(&api.user_email))
+        .unwrap_or(false);
+    if is_owner || api.is_admin {
+        return Ok(());
+    }
+    let message = runtime
+        .maintenance_message
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "Market 正在维护，预计稍后恢复。".to_string());
+    Err(ApiError::Http {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        error_type: "api_error",
+        code: "market_maintenance",
+        message,
+        param: None,
     })
 }
 
@@ -3116,7 +3157,9 @@ mod tests {
     fn api_key_vendor_scope_defaults_by_agent() {
         let api = ApiKeyPrincipal {
             user_id: Uuid::nil(),
+            user_email: "user@example.com".into(),
             api_key_id: Uuid::nil(),
+            is_admin: false,
             monthly_spend_cap: None,
             scope_json: None,
         };
@@ -3151,7 +3194,9 @@ mod tests {
     fn api_key_vendor_scope_allows_agent_specific_vendor() {
         let api = ApiKeyPrincipal {
             user_id: Uuid::nil(),
+            user_email: "user@example.com".into(),
             api_key_id: Uuid::nil(),
+            is_admin: false,
             monthly_spend_cap: None,
             scope_json: Some(json!({
                 "agent_model_vendors": {

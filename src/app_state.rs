@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::Context;
 use reqwest::Client;
+use tokio::sync::RwLock;
 
 use crate::{config::Config, db, object_store::ObjectStore};
 
@@ -16,7 +17,15 @@ pub struct AppState {
     pub object_store: ObjectStore,
     pub http: Client,
     pub metrics: AppMetrics,
+    pub market_runtime: Arc<RwLock<MarketRuntimeConfig>>,
     pub started_at: Instant,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MarketRuntimeConfig {
+    pub owner_email: Option<String>,
+    pub maintenance_enabled: bool,
+    pub maintenance_message: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -132,6 +141,7 @@ impl AppState {
             object_store,
             http: Client::new(),
             metrics: AppMetrics::default(),
+            market_runtime: Arc::new(RwLock::new(MarketRuntimeConfig::default())),
             started_at: Instant::now(),
         };
         if state.config.gateio_auto_payout_enabled {

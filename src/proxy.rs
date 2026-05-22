@@ -9,7 +9,7 @@ use chrono::Datelike;
 use futures_util::StreamExt;
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Map, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -1675,10 +1675,153 @@ fn non_stream_sse_response_json(
     fallback_model: &str,
     downstream_path: &str,
 ) -> serde_json::Value {
+    if downstream_path == "/v1/responses" {
+        return responses_response_from_sse(events, usage, fallback_model);
+    }
     if downstream_path == "/v1/messages" || usage_protocol == UsageProtocol::Anthropic {
         return anthropic_message_from_sse(events, usage, fallback_model);
     }
+    if usage_protocol == UsageProtocol::Gemini || downstream_path.contains("generateContent") {
+        return gemini_generate_content_from_sse(events, usage);
+    }
     chat_completion_from_sse(events, usage, fallback_model)
+}
+
+fn responses_response_from_sse(
+    events: &[serde_json::Value],
+    usage: Option<UsageTokens>,
+    fallback_model: &str,
+) -> serde_json::Value {
+    let response = events
+        .iter()
+        .rev()
+        .find(|event| {
+            event.get("type").and_then(|item| item.as_str()) == Some("response.completed")
+        })
+        .and_then(|event| event.get("response"))
+        .or_else(|| events.iter().rev().find_map(|event| event.get("response")))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let mut output = response
+        .get("output")
+        .and_then(|item| item.as_array())
+        .filter(|items| !items.is_empty())
+        .cloned()
+        .unwrap_or_else(|| response_output_items_from_sse(events));
+    if output.is_empty() {
+        let content = response_output_text_from_sse(events);
+        if !content.is_empty() {
+            output.push(serde_json::json!({
+                "id": "msg_non_stream_sse_fallback",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": content,
+                    "annotations": [],
+                }],
+            }));
+        }
+    }
+
+    let id = response
+        .get("id")
+        .and_then(|item| item.as_str())
+        .unwrap_or("resp_non_stream_sse_fallback");
+    let model = response
+        .get("model")
+        .and_then(|item| item.as_str())
+        .unwrap_or(fallback_model);
+    let created_at = response
+        .get("created_at")
+        .and_then(|item| item.as_i64())
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+    let status = response
+        .get("status")
+        .and_then(|item| item.as_str())
+        .or_else(|| response_status_from_sse(events))
+        .unwrap_or("completed");
+    let mut out = response.as_object().cloned().unwrap_or_default();
+    out.insert("id".to_string(), serde_json::json!(id));
+    out.insert("object".to_string(), serde_json::json!("response"));
+    out.insert("created_at".to_string(), serde_json::json!(created_at));
+    out.insert("model".to_string(), serde_json::json!(model));
+    out.insert("status".to_string(), serde_json::json!(status));
+    out.insert("output".to_string(), serde_json::Value::Array(output));
+    out.insert(
+        "usage".to_string(),
+        usage
+            .map(responses_usage_json)
+            .or_else(|| response.get("usage").cloned())
+            .unwrap_or(serde_json::Value::Null),
+    );
+    serde_json::Value::Object(out)
+}
+
+fn response_output_items_from_sse(events: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut items = Vec::new();
+    for item in events
+        .iter()
+        .filter(|event| {
+            event.get("type").and_then(|item| item.as_str()) == Some("response.output_item.done")
+        })
+        .filter_map(|event| event.get("item"))
+    {
+        let dedupe_key = item
+            .get("id")
+            .or_else(|| item.get("call_id"))
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("idx:{}", items.len()));
+        if seen.insert(dedupe_key) {
+            items.push(item.clone());
+        }
+    }
+    items
+}
+
+fn response_output_text_from_sse(events: &[serde_json::Value]) -> String {
+    events
+        .iter()
+        .rev()
+        .find(|event| {
+            event.get("type").and_then(|item| item.as_str()) == Some("response.output_text.done")
+        })
+        .and_then(|event| event.get("text").and_then(|item| item.as_str()))
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            events
+                .iter()
+                .filter(|event| {
+                    event.get("type").and_then(|item| item.as_str())
+                        == Some("response.output_text.delta")
+                })
+                .filter_map(|event| event.get("delta").and_then(|item| item.as_str()))
+                .collect::<String>()
+        })
+}
+
+fn response_status_from_sse(events: &[serde_json::Value]) -> Option<&'static str> {
+    if events
+        .iter()
+        .any(|event| event.get("type").and_then(|item| item.as_str()) == Some("response.failed"))
+    {
+        return Some("failed");
+    }
+    if events.iter().any(|event| {
+        event.get("type").and_then(|item| item.as_str()) == Some("response.incomplete")
+    }) {
+        return Some("incomplete");
+    }
+    if events
+        .iter()
+        .any(|event| event.get("type").and_then(|item| item.as_str()) == Some("response.completed"))
+    {
+        return Some("completed");
+    }
+    None
 }
 
 fn chat_completion_from_sse(
@@ -1749,13 +1892,7 @@ fn anthropic_message_from_sse(
         .find_map(|event| event.get("message"))
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
-    let content = events
-        .iter()
-        .filter(|event| {
-            event.get("type").and_then(|item| item.as_str()) == Some("content_block_delta")
-        })
-        .filter_map(|event| event.pointer("/delta/text").and_then(|item| item.as_str()))
-        .collect::<String>();
+    let content = anthropic_content_from_sse(events);
     let id = message
         .get("id")
         .and_then(|item| item.as_str())
@@ -1764,19 +1901,186 @@ fn anthropic_message_from_sse(
         .get("model")
         .and_then(|item| item.as_str())
         .unwrap_or(fallback_model);
+    let stop_reason = events
+        .iter()
+        .rev()
+        .find_map(|event| {
+            event
+                .pointer("/delta/stop_reason")
+                .and_then(|item| item.as_str())
+        })
+        .or_else(|| message.get("stop_reason").and_then(|item| item.as_str()))
+        .unwrap_or_else(|| {
+            if content
+                .iter()
+                .any(|item| item.get("type").and_then(|value| value.as_str()) == Some("tool_use"))
+            {
+                "tool_use"
+            } else {
+                "end_turn"
+            }
+        });
     serde_json::json!({
         "id": id,
         "type": "message",
         "role": "assistant",
         "model": model,
-        "content": [{
-            "type": "text",
-            "text": content,
-        }],
-        "stop_reason": "end_turn",
+        "content": content,
+        "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": usage.map(anthropic_usage_json).unwrap_or(serde_json::Value::Null),
     })
+}
+
+fn anthropic_content_from_sse(events: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut blocks = std::collections::BTreeMap::<i64, serde_json::Value>::new();
+    let mut tool_input_json = std::collections::BTreeMap::<i64, String>::new();
+    for event in events {
+        let index = event
+            .get("index")
+            .and_then(|item| item.as_i64())
+            .unwrap_or(0);
+        match event.get("type").and_then(|item| item.as_str()) {
+            Some("content_block_start") => {
+                if let Some(block) = event.get("content_block") {
+                    blocks.insert(index, block.clone());
+                }
+            }
+            Some("content_block_delta") => {
+                let Some(delta) = event.get("delta") else {
+                    continue;
+                };
+                if let Some(text) = delta
+                    .get("text")
+                    .or_else(|| delta.get("thinking"))
+                    .and_then(|item| item.as_str())
+                {
+                    let block = blocks.entry(index).or_insert_with(|| {
+                        serde_json::json!({
+                            "type": "text",
+                            "text": "",
+                        })
+                    });
+                    append_string_field(block, "text", text);
+                } else if let Some(partial) =
+                    delta.get("partial_json").and_then(|item| item.as_str())
+                {
+                    tool_input_json.entry(index).or_default().push_str(partial);
+                }
+            }
+            _ => {}
+        }
+    }
+    for (index, partial) in tool_input_json {
+        let parsed = serde_json::from_str::<serde_json::Value>(&partial)
+            .unwrap_or_else(|_| serde_json::json!({ "_partial_json": partial }));
+        let block = blocks.entry(index).or_insert_with(|| {
+            serde_json::json!({
+                "type": "tool_use",
+                "id": format!("toolu_non_stream_sse_fallback_{index}"),
+                "name": "",
+            })
+        });
+        if let Some(object) = block.as_object_mut() {
+            object.insert("input".to_string(), parsed);
+        }
+    }
+    let mut content = blocks.into_values().collect::<Vec<_>>();
+    if content.is_empty() {
+        let text = events
+            .iter()
+            .filter(|event| {
+                event.get("type").and_then(|item| item.as_str()) == Some("content_block_delta")
+            })
+            .filter_map(|event| event.pointer("/delta/text").and_then(|item| item.as_str()))
+            .collect::<String>();
+        if !text.is_empty() {
+            content.push(serde_json::json!({
+                "type": "text",
+                "text": text,
+            }));
+        }
+    }
+    content
+}
+
+fn gemini_generate_content_from_sse(
+    events: &[serde_json::Value],
+    usage: Option<UsageTokens>,
+) -> serde_json::Value {
+    let mut text = String::new();
+    let mut parts = Vec::<serde_json::Value>::new();
+    let mut finish_reason = None::<serde_json::Value>;
+    let mut safety_ratings = None::<serde_json::Value>;
+    let mut usage_metadata = None::<serde_json::Value>;
+    for event in events {
+        if let Some(usage) = event.get("usageMetadata") {
+            usage_metadata = Some(usage.clone());
+        }
+        let Some(candidates) = event.get("candidates").and_then(|item| item.as_array()) else {
+            continue;
+        };
+        for candidate in candidates {
+            if let Some(value) = candidate.get("finishReason") {
+                finish_reason = Some(value.clone());
+            }
+            if let Some(value) = candidate.get("safetyRatings") {
+                safety_ratings = Some(value.clone());
+            }
+            for part in candidate
+                .pointer("/content/parts")
+                .and_then(|item| item.as_array())
+                .into_iter()
+                .flatten()
+            {
+                if let Some(value) = part.get("text").and_then(|item| item.as_str()) {
+                    text.push_str(value);
+                } else {
+                    parts.push(part.clone());
+                }
+            }
+        }
+    }
+    if !text.is_empty() {
+        parts.insert(0, serde_json::json!({ "text": text }));
+    }
+    let mut candidate = Map::new();
+    candidate.insert(
+        "content".to_string(),
+        serde_json::json!({
+            "parts": parts,
+            "role": "model",
+        }),
+    );
+    if let Some(value) = finish_reason {
+        candidate.insert("finishReason".to_string(), value);
+    }
+    if let Some(value) = safety_ratings {
+        candidate.insert("safetyRatings".to_string(), value);
+    }
+    let mut out = Map::new();
+    out.insert(
+        "candidates".to_string(),
+        serde_json::Value::Array(vec![serde_json::Value::Object(candidate)]),
+    );
+    out.insert(
+        "usageMetadata".to_string(),
+        usage_metadata
+            .or_else(|| usage.map(gemini_usage_metadata_json))
+            .unwrap_or(serde_json::Value::Null),
+    );
+    serde_json::Value::Object(out)
+}
+
+fn append_string_field(value: &mut serde_json::Value, key: &str, extra: &str) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let current = object.get(key).and_then(|item| item.as_str()).unwrap_or("");
+    object.insert(
+        key.to_string(),
+        serde_json::json!(format!("{current}{extra}")),
+    );
 }
 
 fn openai_compatible_usage_json(usage: UsageTokens) -> serde_json::Value {
@@ -1791,12 +2095,33 @@ fn openai_compatible_usage_json(usage: UsageTokens) -> serde_json::Value {
     })
 }
 
+fn responses_usage_json(usage: UsageTokens) -> serde_json::Value {
+    serde_json::json!({
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "total_tokens": usage.input_tokens + usage.output_tokens,
+        "input_tokens_details": {
+            "cached_tokens": usage.cache_read_tokens,
+        },
+        "cache_creation_input_tokens": usage.cache_write_tokens,
+    })
+}
+
 fn anthropic_usage_json(usage: UsageTokens) -> serde_json::Value {
     serde_json::json!({
         "input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
         "cache_read_input_tokens": usage.cache_read_tokens,
         "cache_creation_input_tokens": usage.cache_write_tokens,
+    })
+}
+
+fn gemini_usage_metadata_json(usage: UsageTokens) -> serde_json::Value {
+    serde_json::json!({
+        "promptTokenCount": usage.input_tokens,
+        "candidatesTokenCount": usage.output_tokens,
+        "totalTokenCount": usage.input_tokens + usage.output_tokens,
+        "cachedContentTokenCount": usage.cache_read_tokens,
     })
 }
 
@@ -3264,6 +3589,134 @@ data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.5","
                 .unwrap()
                 .iter()
                 .any(|flag| flag.as_str() == Some("non_stream_sse_fallback"))
+        );
+    }
+
+    #[test]
+    fn parses_non_stream_responses_sse_fallback_as_responses_json_with_function_call() {
+        let text = r#"event: response.created
+data: {"type":"response.created","response":{"id":"resp_tool","model":"gpt-5.5","created_at":1778144036,"status":"in_progress","usage":null}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_1","type":"function_call","status":"completed","call_id":"call_1","name":"act","arguments":"{\"action\":\"click\",\"x\":1}"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_tool","model":"gpt-5.5","created_at":1778144036,"status":"completed","usage":{"input_tokens":5,"output_tokens":6,"total_tokens":11}}}
+
+"#;
+        let fallback =
+            parse_non_stream_sse_fallback(text, UsageProtocol::Codex, "gpt-5.5", "/v1/responses");
+
+        assert_eq!(fallback.response_json["object"], "response");
+        assert_eq!(fallback.response_json["id"], "resp_tool");
+        assert_eq!(fallback.response_json["status"], "completed");
+        assert_eq!(fallback.response_json["output"][0]["type"], "function_call");
+        assert_eq!(fallback.response_json["output"][0]["name"], "act");
+        assert_eq!(fallback.response_json["output"][0]["call_id"], "call_1");
+        assert_eq!(
+            fallback.response_json["output"][0]["arguments"],
+            "{\"action\":\"click\",\"x\":1}"
+        );
+        assert_eq!(fallback.response_json["usage"]["input_tokens"], 5);
+    }
+
+    #[test]
+    fn parses_non_stream_responses_sse_fallback_as_responses_text_output() {
+        let text = r#"event: response.created
+data: {"type":"response.created","response":{"id":"resp_text","model":"gpt-5.5","created_at":1778144036,"usage":null}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"Hi"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"!"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_text","model":"gpt-5.5","created_at":1778144036,"status":"completed","usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}}
+
+"#;
+        let fallback =
+            parse_non_stream_sse_fallback(text, UsageProtocol::Codex, "gpt-5.5", "/v1/responses");
+
+        assert_eq!(fallback.response_json["object"], "response");
+        assert_eq!(fallback.response_json["output"][0]["type"], "message");
+        assert_eq!(
+            fallback.response_json["output"][0]["content"][0]["text"],
+            "Hi!"
+        );
+    }
+
+    #[test]
+    fn parses_non_stream_anthropic_sse_fallback_with_tool_use() {
+        let text = r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"act","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"action\":\"click\""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":",\"x\":1}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":6}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+        let fallback = parse_non_stream_sse_fallback(
+            text,
+            UsageProtocol::Anthropic,
+            "claude-sonnet-4-6",
+            "/v1/messages",
+        );
+
+        assert_eq!(fallback.response_json["type"], "message");
+        assert_eq!(fallback.response_json["stop_reason"], "tool_use");
+        assert_eq!(fallback.response_json["content"][0]["type"], "tool_use");
+        assert_eq!(fallback.response_json["content"][0]["name"], "act");
+        assert_eq!(
+            fallback.response_json["content"][0]["input"],
+            json!({"action":"click","x":1})
+        );
+    }
+
+    #[test]
+    fn parses_non_stream_gemini_sse_fallback_with_function_call() {
+        let text = r#"data: {"candidates":[{"content":{"parts":[{"text":"Working "}],"role":"model"}}],"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":2,"totalTokenCount":6}}
+
+data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"act","args":{"action":"click","x":1}}}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":5,"totalTokenCount":9}}
+
+"#;
+        let fallback = parse_non_stream_sse_fallback(
+            text,
+            UsageProtocol::Gemini,
+            "gemini-2.5-flash",
+            "/v1beta/models/gemini-2.5-flash:generateContent",
+        );
+
+        assert!(fallback.response_json.get("choices").is_none());
+        assert_eq!(
+            fallback.response_json["candidates"][0]["content"]["parts"][0]["text"],
+            "Working "
+        );
+        assert_eq!(
+            fallback.response_json["candidates"][0]["content"]["parts"][1]["functionCall"]["name"],
+            "act"
+        );
+        assert_eq!(
+            fallback.response_json["candidates"][0]["finishReason"],
+            "STOP"
+        );
+        assert_eq!(
+            fallback.response_json["usageMetadata"]["promptTokenCount"],
+            4
         );
     }
 }

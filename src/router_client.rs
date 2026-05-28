@@ -470,6 +470,9 @@ mod tests {
         assert!((share.signals.headroom - 0.4).abs() < 1e-9);
         assert_eq!(share.signals.samples_10m, 7);
         assert!((share.signals.owner_penalty - 0.5).abs() < 1e-9);
-        assert_eq!(share.share_created_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(
+            share.share_created_at.as_deref(),
+            Some("2026-01-01T00:00:00Z")
+        );
     }
 }

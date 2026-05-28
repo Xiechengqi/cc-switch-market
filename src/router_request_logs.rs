@@ -28,6 +28,7 @@ struct RouterRequestLog {
     actual_model_source: String,
     status: String,
     status_code: Option<u16>,
+    error_message: Option<String>,
     latency_ms: Option<u64>,
     input_tokens: u32,
     output_tokens: u32,
@@ -52,7 +53,7 @@ pub async fn sync_recent(state: &AppState) -> Result<usize, ApiError> {
                    ) AS share_subdomain,
                    rc.app_type, rc.model, rc.request_agent, rc.requested_model, rc.actual_model, rc.actual_model_source,
                    rc.pricing_model, rc.pricing_model_source,
-                   rc.status, rc.usage_amount, rc.usage_json,
+                   rc.status, rc.usage_amount, rc.usage_json, rc.audit_flags,
                    rc.created_at, rc.settled_at,
                    ra.latency_ms
               FROM request_charges rc
@@ -85,6 +86,11 @@ pub async fn sync_recent(state: &AppState) -> Result<usize, ApiError> {
                 .opt_string("usage_json")
                 .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
                 .unwrap_or(Value::Null);
+            let audit_flags = row
+                .opt_string("audit_flags")
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .unwrap_or(Value::Null);
+            let error_message = failure_error_message(&audit_flags);
             RouterRequestLog {
                 request_id: row.string("request_id"),
                 user_email: row.opt_string("user_email"),
@@ -108,7 +114,11 @@ pub async fn sync_recent(state: &AppState) -> Result<usize, ApiError> {
                     .or_else(|| row.opt_string("pricing_model_source"))
                     .unwrap_or_else(|| "official".to_string()),
                 status: row.string("status"),
-                status_code: status_code_for_charge(&row.string("status")),
+                status_code: status_code_for_charge(
+                    &row.string("status"),
+                    error_message.as_deref(),
+                ),
+                error_message,
                 latency_ms: row
                     .opt_string("latency_ms")
                     .and_then(|value| value.parse().ok()),
@@ -209,10 +219,92 @@ fn request_agent_for_app_type(app_type: &str) -> &'static str {
     }
 }
 
-fn status_code_for_charge(status: &str) -> Option<u16> {
+fn failure_error_message(audit_flags: &Value) -> Option<String> {
+    let array = audit_flags.as_array()?;
+    let mut messages = Vec::new();
+    for value in array {
+        if let Some(message) = value.get("message").and_then(Value::as_str) {
+            if !message.trim().is_empty() {
+                messages.push(message.trim().to_string());
+            }
+        } else if let Some(code) = value.get("code").and_then(Value::as_str) {
+            if !code.trim().is_empty() {
+                messages.push(code.trim().to_string());
+            }
+        }
+    }
+    (!messages.is_empty()).then(|| messages.join("; "))
+}
+
+fn status_code_for_charge(status: &str, error_message: Option<&str>) -> Option<u16> {
     match status {
         "settled" | "streaming" => Some(200),
-        "failed_released" => Some(500),
+        "failed_released" => Some(status_code_for_failure(error_message.unwrap_or_default())),
         _ => None,
+    }
+}
+
+fn status_code_for_failure(message: &str) -> u16 {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("429")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("usage credits are required")
+    {
+        429
+    } else if lower.contains("400")
+        || lower.contains("bad request")
+        || lower.contains("model_max_prompt_tokens_exceeded")
+        || lower.contains("prompt token count")
+        || lower.contains("context length")
+        || lower.contains("context_length_exceeded")
+    {
+        400
+    } else if lower.contains("401") {
+        401
+    } else if lower.contains("403") {
+        403
+    } else if lower.contains("404") || lower.contains("not found") {
+        404
+    } else if lower.contains("422") {
+        422
+    } else {
+        500
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failure_status_code_preserves_request_shape_and_rate_limit_errors() {
+        assert_eq!(
+            status_code_for_charge(
+                "failed_released",
+                Some("prompt token count of 128078 exceeds the limit of 128000"),
+            ),
+            Some(400)
+        );
+        assert_eq!(
+            status_code_for_charge(
+                "failed_released",
+                Some("Usage credits are required for long context requests."),
+            ),
+            Some(429)
+        );
+        assert_eq!(status_code_for_charge("failed_released", None), Some(500));
+    }
+
+    #[test]
+    fn failure_error_message_extracts_audit_object_messages() {
+        let flags = serde_json::json!([
+            {"code": "upstream_failed", "message": "router market proxy returned 400 Bad Request"},
+            "manual_flag"
+        ]);
+        assert_eq!(
+            failure_error_message(&flags).as_deref(),
+            Some("router market proxy returned 400 Bad Request")
+        );
     }
 }

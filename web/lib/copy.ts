@@ -298,7 +298,7 @@ export const copy = {
         topupSubmitting: "创建中…",
         topupErrorInvalid: "金额无效",
         topupErrorInvalidDesc: "请输入大于 0 的 USD 金额",
-        topupFirstLimitDesc: "首冲最多 10$，建议先小额体验后再充值更多",
+        topupFirstLimitDesc: "单次充值最多 1000$",
         topupOrderCreated: "订单已创建",
         topupOrderNoUrl: "未返回支付链接，请稍后再试",
         topupErrorTitle: "充值失败",
@@ -1251,8 +1251,7 @@ export const copy = {
         topupSubmitting: "Creating…",
         topupErrorInvalid: "Invalid amount",
         topupErrorInvalidDesc: "Please enter a USD amount greater than 0.",
-        topupFirstLimitDesc:
-          "First top-up is limited to $10. Try a small amount first, then top up more.",
+        topupFirstLimitDesc: "A single top-up is limited to $1000.",
         topupOrderCreated: "Order created",
         topupOrderNoUrl: "No payment URL returned. Please try again.",
         topupErrorTitle: "Top up failed",

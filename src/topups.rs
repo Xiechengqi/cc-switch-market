@@ -20,8 +20,8 @@ use crate::{
     router_notifications,
 };
 
-const FIRST_TOPUP_MAX_USD: i64 = 10;
-const FIRST_TOPUP_LIMIT_MESSAGE: &str = "首冲最多 10$，建议先小额体验后再充值更多";
+const TOPUP_MAX_USD: i64 = 1000;
+const TOPUP_LIMIT_MESSAGE: &str = "单次充值最多 1000$";
 const TOPUP_ORDER_TTL_MINUTES: i64 = 30;
 
 #[derive(Deserialize)]
@@ -88,7 +88,7 @@ pub async fn create_checkout(
     let db = state.db();
     ledger::ensure_user_accounts(db, principal.user_id).await?;
     ledger::ensure_platform_accounts(db).await?;
-    enforce_first_topup_limit(db, principal.user_id, input.amount_usd).await?;
+    enforce_topup_amount_limit(input.amount_usd)?;
     let (fee, fee_policy_snapshot) = fee_for_topup(db, input.amount_usd).await?;
     let net = input.amount_usd - fee;
     if net <= Decimal::ZERO {
@@ -128,25 +128,11 @@ pub async fn create_checkout(
     Ok(Json(row_to_topup(row)))
 }
 
-async fn enforce_first_topup_limit(
-    db: &crate::db::Db,
-    user_id: Uuid,
-    amount: Decimal,
-) -> Result<(), ApiError> {
-    if amount <= Decimal::from(FIRST_TOPUP_MAX_USD) {
-        return Ok(());
-    }
-    let paid_count = db
-        .query_one(
-            "SELECT COUNT(*) AS count FROM topup_orders WHERE user_id=?1 AND status='paid'",
-            vec![crate::db::uuid_val(user_id)],
-        )
-        .await?
-        .i64("count");
-    if first_topup_exceeds_limit(amount, paid_count) {
+fn enforce_topup_amount_limit(amount: Decimal) -> Result<(), ApiError> {
+    if topup_exceeds_limit(amount) {
         return Err(ApiError::bad_request(
-            "first_topup_amount_exceeded",
-            FIRST_TOPUP_LIMIT_MESSAGE,
+            "topup_amount_exceeded",
+            TOPUP_LIMIT_MESSAGE,
         ));
     }
     Ok(())
@@ -156,8 +142,8 @@ fn topup_order_expires_at(now: chrono::DateTime<Utc>) -> String {
     (now + Duration::minutes(TOPUP_ORDER_TTL_MINUTES)).to_rfc3339()
 }
 
-fn first_topup_exceeds_limit(amount: Decimal, paid_topup_count: i64) -> bool {
-    paid_topup_count == 0 && amount > Decimal::from(FIRST_TOPUP_MAX_USD)
+fn topup_exceeds_limit(amount: Decimal) -> bool {
+    amount > Decimal::from(TOPUP_MAX_USD)
 }
 
 async fn fee_for_topup(
@@ -724,27 +710,23 @@ fn hmac_sha256(secret: Vec<u8>, payload: &[u8]) -> Result<Vec<u8>, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FIRST_TOPUP_LIMIT_MESSAGE, FIRST_TOPUP_MAX_USD, TOPUP_ORDER_TTL_MINUTES,
-        first_topup_exceeds_limit, topup_order_expires_at,
+        TOPUP_LIMIT_MESSAGE, TOPUP_MAX_USD, TOPUP_ORDER_TTL_MINUTES, topup_exceeds_limit,
+        topup_order_expires_at,
     };
     use chrono::{TimeZone, Utc};
     use rust_decimal::Decimal;
 
     #[test]
-    fn first_topup_limit_constants_match_policy() {
-        assert_eq!(FIRST_TOPUP_MAX_USD, 10);
-        assert_eq!(
-            FIRST_TOPUP_LIMIT_MESSAGE,
-            "首冲最多 10$，建议先小额体验后再充值更多"
-        );
+    fn topup_limit_constants_match_policy() {
+        assert_eq!(TOPUP_MAX_USD, 1000);
+        assert_eq!(TOPUP_LIMIT_MESSAGE, "单次充值最多 1000$");
     }
 
     #[test]
-    fn first_topup_limit_only_blocks_first_successful_topup_over_ten() {
-        assert!(!first_topup_exceeds_limit(Decimal::new(999, 2), 0));
-        assert!(!first_topup_exceeds_limit(Decimal::new(1000, 2), 0));
-        assert!(first_topup_exceeds_limit(Decimal::new(1001, 2), 0));
-        assert!(!first_topup_exceeds_limit(Decimal::new(1001, 2), 1));
+    fn topup_limit_blocks_single_topup_over_one_thousand() {
+        assert!(!topup_exceeds_limit(Decimal::new(99999, 2)));
+        assert!(!topup_exceeds_limit(Decimal::new(100000, 2)));
+        assert!(topup_exceeds_limit(Decimal::new(100001, 2)));
     }
 
     #[test]

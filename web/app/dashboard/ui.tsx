@@ -391,17 +391,13 @@ function WalletTab() {
           { key: "time", header: c.wallet.colTime, mobileLabel: c.wallet.colTime, render: (r) => <span className="text-xs text-slate-500">{formatDate(r.created_at)}</span> }
         ]}
       />
-      <TopupModal open={topupOpen} onClose={() => { setTopupOpen(false); reload(); }} isFirstTopup={!hasSuccessfulTopup(items)} />
+      <TopupModal open={topupOpen} onClose={() => { setTopupOpen(false); reload(); }} />
       <TransferClaimModal open={transferOpen} onClose={() => { setTransferOpen(false); reload(); }} max={claimAvailable} />
     </div>
   );
 }
 
-function hasSuccessfulTopup(items: MoneyEvent[] | null) {
-  return (items ?? []).some((item) => item.event_type === "topup" || item.reference_type === "topup");
-}
-
-function TopupModal({ open, onClose, isFirstTopup }: { open: boolean; onClose: () => void; isFirstTopup: boolean }) {
+function TopupModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   const toast = useToast();
   const { locale } = useLocale();
   const c = copy[locale].dashboard.wallet;
@@ -418,7 +414,7 @@ function TopupModal({ open, onClose, isFirstTopup }: { open: boolean; onClose: (
       form.setError("amount", { type: "validate", message: c.topupErrorInvalidDesc });
       return;
     }
-    if (isFirstTopup && Number(amount) > 10) {
+    if (Number(amount) > 1000) {
       form.setError("amount", { type: "validate", message: c.topupFirstLimitDesc });
       return;
     }
@@ -476,7 +472,7 @@ function TopupModal({ open, onClose, isFirstTopup }: { open: boolean; onClose: (
             )}
           />
           <div className="mt-1 flex flex-wrap gap-2">
-            {["5", "10", "25", "50", "100"].map((v) => (
+            {["5", "10", "25", "50", "100", "500", "1000"].map((v) => (
               <button key={v} type="button" onClick={() => form.setValue("amount", v, { shouldDirty: true, shouldValidate: true })} className="rounded-full border-2 border-slate-800 bg-white px-3 py-1 text-sm font-bold lift">${v}</button>
             ))}
           </div>

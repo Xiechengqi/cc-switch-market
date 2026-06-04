@@ -1,3 +1,4 @@
+use axum::{Json, extract::State, http::HeaderMap};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use tokio::time::{Duration, sleep};
@@ -109,6 +110,41 @@ pub struct MarketShareRuntimeState {
 struct MarketShareRuntimeStateSyncRequest {
     replace: bool,
     states: Vec<MarketShareRuntimeState>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseMarketShareStateRequest {
+    pub router_id: String,
+    pub share_id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub app_type: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseMarketShareStateResponse {
+    pub ok: bool,
+    pub released: usize,
+    pub synced: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RouterSessionMeResponse {
+    authenticated: bool,
+    user: Option<RouterSessionUser>,
+    #[serde(default)]
+    is_admin: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RouterSessionUser {
+    email: String,
 }
 
 fn default_quota_health() -> f64 {
@@ -248,6 +284,158 @@ pub async fn sync_share_runtime_states(
         .get("synced")
         .and_then(|value| value.as_u64())
         .unwrap_or(0) as usize)
+}
+
+pub async fn release_share_state_endpoint(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<ReleaseMarketShareStateRequest>,
+) -> Result<Json<ReleaseMarketShareStateResponse>, ApiError> {
+    authorize_router_market_manager(&state, &headers).await?;
+    let released = release_share_state(&state, input).await?;
+    let synced = sync_share_runtime_state_snapshot(&state).await.unwrap_or_else(|err| {
+        tracing::warn!(error = %err, "router share runtime state snapshot sync after release failed");
+        0
+    });
+    Ok(Json(ReleaseMarketShareStateResponse {
+        ok: true,
+        released,
+        synced,
+    }))
+}
+
+async fn authorize_router_market_manager(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .and_then(|value| {
+            value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::unauthorized("missing router bearer token"))?;
+    let response = state
+        .http
+        .get(format!(
+            "{}/v1/auth/session/me",
+            state.config.router_api_base_url.trim_end_matches('/')
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|err| {
+            ApiError::service_unavailable(format!("router session verification failed: {err}"))
+        })?;
+    if !response.status().is_success() {
+        return Err(ApiError::unauthorized("invalid router bearer token"));
+    }
+    let session: RouterSessionMeResponse = response.json().await.map_err(|err| {
+        ApiError::service_unavailable(format!("parse router session response failed: {err}"))
+    })?;
+    let email = session
+        .user
+        .as_ref()
+        .map(|user| user.email.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    if !session.authenticated || email.is_none() {
+        return Err(ApiError::unauthorized(
+            "router session is not authenticated",
+        ));
+    }
+    let owner = state
+        .market_runtime
+        .read()
+        .await
+        .owner_email
+        .clone()
+        .map(|value| value.trim().to_ascii_lowercase());
+    if session.is_admin || owner == email {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(
+            "only router admin or market owner can release share state",
+        ))
+    }
+}
+
+async fn release_share_state(
+    state: &AppState,
+    input: ReleaseMarketShareStateRequest,
+) -> Result<usize, ApiError> {
+    let router_id = input.router_id.trim();
+    let share_id = input.share_id.trim();
+    if router_id.is_empty() || share_id.is_empty() {
+        return Err(ApiError::bad_request(
+            "invalid_share",
+            "router_id and share_id are required",
+        ));
+    }
+    match input.kind.trim() {
+        "cooldown" => {
+            let changed = state
+                .db()
+                .execute(
+                    "UPDATE router_shares SET last_error_at=NULL, last_error_message=NULL, failure_count=0, cooldown_until=NULL WHERE router_id=?1 AND share_id=?2",
+                    vec![crate::db::val(router_id), crate::db::val(share_id)],
+                )
+                .await?;
+            Ok(changed as usize)
+        }
+        "model_block" => {
+            let model_id = input
+                .model_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ApiError::bad_request("invalid_model_block", "model_id is required")
+                })?;
+            let changed = state
+                .db()
+                .execute(
+                    "DELETE FROM model_share_blocks WHERE router_id=?1 AND share_id=?2 AND model_id=?3",
+                    vec![
+                        crate::db::val(router_id),
+                        crate::db::val(share_id),
+                        crate::db::val(model_id),
+                    ],
+                )
+                .await?;
+            Ok(changed as usize)
+        }
+        "capability_block" => {
+            let capability = input
+                .app_type
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ApiError::bad_request("invalid_capability_block", "app_type is required")
+                })?;
+            let changed = state
+                .db()
+                .execute(
+                    "DELETE FROM market_share_capability_blocks WHERE router_id=?1 AND share_id=?2 AND capability=?3",
+                    vec![
+                        crate::db::val(router_id),
+                        crate::db::val(share_id),
+                        crate::db::val(capability),
+                    ],
+                )
+                .await?;
+            Ok(changed as usize)
+        }
+        other => Err(ApiError::bad_request(
+            "unsupported_share_state_kind",
+            format!("unsupported share state kind: {other}"),
+        )),
+    }
 }
 
 pub async fn sync_shares(state: &AppState) -> Result<usize, ApiError> {

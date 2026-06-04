@@ -306,6 +306,10 @@ fn build_router(state: AppState) -> Router {
             get(api_keys::available_shares_endpoint),
         )
         .route(
+            "/market-api/router/share-states/release",
+            post(router_client::release_share_state_endpoint),
+        )
+        .route(
             "/v1/api-key-secrets",
             get(api_keys::list_api_key_secrets_endpoint)
                 .post(api_keys::create_api_key_secret_endpoint),

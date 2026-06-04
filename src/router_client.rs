@@ -80,6 +80,37 @@ impl Default for ShareSignals {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketShareRuntimeState {
+    pub share_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub router_id: Option<String>,
+    pub scope: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MarketShareRuntimeStateSyncRequest {
+    replace: bool,
+    states: Vec<MarketShareRuntimeState>,
+}
+
 fn default_quota_health() -> f64 {
     0.5
 }
@@ -172,6 +203,51 @@ async fn report_rate_limited_inner(state: &AppState, share_id: &str) -> Result<(
         )));
     }
     Ok(())
+}
+
+pub fn report_share_runtime_state(state: &AppState, runtime_state: MarketShareRuntimeState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        if let Err(err) = sync_share_runtime_states(&state, false, vec![runtime_state]).await {
+            tracing::warn!(error = %err, "router share runtime state POST failed");
+        }
+    });
+}
+
+pub async fn sync_share_runtime_states(
+    state: &AppState,
+    replace: bool,
+    states: Vec<MarketShareRuntimeState>,
+) -> Result<usize, ApiError> {
+    let access_token = crate::router_account::access_token(&state.config)
+        .await
+        .map_err(|e| ApiError::service_unavailable(format!("router login required: {e}")))?;
+    let url = format!(
+        "{}/v1/market/share-states",
+        state.config.router_api_base_url.trim_end_matches('/')
+    );
+    let body = MarketShareRuntimeStateSyncRequest { replace, states };
+    let response = state
+        .http
+        .post(url)
+        .bearer_auth(access_token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            ApiError::service_unavailable(format!("router share state sync failed: {e}"))
+        })?;
+    if !response.status().is_success() {
+        return Err(ApiError::service_unavailable(format!(
+            "router share state sync returned {}",
+            response.status()
+        )));
+    }
+    let value: serde_json::Value = response.json().await.unwrap_or_default();
+    Ok(value
+        .get("synced")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as usize)
 }
 
 pub async fn sync_shares(state: &AppState) -> Result<usize, ApiError> {
@@ -299,6 +375,94 @@ pub async fn sync_shares(state: &AppState) -> Result<usize, ApiError> {
     Ok(count)
 }
 
+pub async fn sync_share_runtime_state_snapshot(state: &AppState) -> Result<usize, ApiError> {
+    let now = crate::db::now_string();
+    let mut states = Vec::new();
+    let db = state.db();
+
+    for row in db
+        .query_all(
+            r#"
+            SELECT router_id, share_id, cooldown_until, failure_count, last_error_message
+              FROM router_shares
+             WHERE cooldown_until IS NOT NULL AND cooldown_until > ?1
+            "#,
+            vec![crate::db::val(&now)],
+        )
+        .await?
+    {
+        states.push(MarketShareRuntimeState {
+            share_id: row.string("share_id"),
+            router_id: Some(row.string("router_id")),
+            scope: "share".to_string(),
+            kind: "cooldown".to_string(),
+            app_type: None,
+            model_id: None,
+            model_name: None,
+            reason_kind: Some("share_cooldown".to_string()),
+            reason: row.opt_string("last_error_message"),
+            failure_count: Some(row.i64("failure_count")),
+            expires_at: row.opt_string("cooldown_until"),
+        });
+    }
+
+    for row in db
+        .query_all(
+            r#"
+            SELECT msb.router_id, msb.share_id, msb.model_id,
+                   COALESCE(m.display_name, m.model_pattern, m.canonical_name) AS model_name,
+                   m.app_type, msb.reason, msb.expires_at
+              FROM model_share_blocks msb
+              LEFT JOIN models m ON m.id = msb.model_id
+             WHERE msb.expires_at > ?1
+            "#,
+            vec![crate::db::val(&now)],
+        )
+        .await?
+    {
+        states.push(MarketShareRuntimeState {
+            share_id: row.string("share_id"),
+            router_id: Some(row.string("router_id")),
+            scope: "model".to_string(),
+            kind: "model_block".to_string(),
+            app_type: row.opt_string("app_type"),
+            model_id: Some(row.string("model_id")),
+            model_name: row.opt_string("model_name"),
+            reason_kind: Some("model_unsupported".to_string()),
+            reason: row.opt_string("reason"),
+            failure_count: None,
+            expires_at: row.opt_string("expires_at"),
+        });
+    }
+
+    for row in db
+        .query_all(
+            r#"
+            SELECT router_id, share_id, capability, reason, created_at
+              FROM market_share_capability_blocks
+            "#,
+            vec![],
+        )
+        .await?
+    {
+        states.push(MarketShareRuntimeState {
+            share_id: row.string("share_id"),
+            router_id: Some(row.string("router_id")),
+            scope: "capability".to_string(),
+            kind: "capability_block".to_string(),
+            app_type: Some(row.string("capability")),
+            model_id: None,
+            model_name: None,
+            reason_kind: Some("capability_block".to_string()),
+            reason: row.opt_string("reason"),
+            failure_count: None,
+            expires_at: None,
+        });
+    }
+
+    sync_share_runtime_states(state, true, states).await
+}
+
 async fn prune_missing_router_shares(
     tx: &crate::db::DbTx,
     seen: &HashSet<(String, String)>,
@@ -400,7 +564,12 @@ pub fn spawn_share_sync(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match sync_shares(&state).await {
-                Ok(count) => tracing::debug!(synced = count, "router share sync completed"),
+                Ok(count) => {
+                    tracing::debug!(synced = count, "router share sync completed");
+                    if let Err(err) = sync_share_runtime_state_snapshot(&state).await {
+                        tracing::warn!(error = %err, "router share runtime state snapshot sync failed");
+                    }
+                }
                 Err(err) => tracing::warn!(error = %err, "router share sync failed"),
             }
             sleep(Duration::from_secs(30)).await;

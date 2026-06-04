@@ -1457,17 +1457,12 @@ async fn forward_to_router_market_proxy(
     if !status.is_success() {
         let value = serde_json::from_str::<serde_json::Value>(&text)
             .unwrap_or_else(|_| json!({ "raw": text }));
-        record_share_health(
-            state,
-            share,
-            "error",
-            None,
-            Some(format!("router market proxy returned {status}: {value}")),
-        )
-        .await;
-        return Err(ApiError::service_unavailable(format!(
-            "router market proxy returned {status}: {value}"
-        )));
+        let error_message = format!("router market proxy returned {status}: {value}");
+        let kind = classify_upstream_failure(&error_message);
+        if kind != "bad_request" {
+            record_share_health(state, share, "error", None, Some(error_message.clone())).await;
+        }
+        return Err(router_market_proxy_error(status, error_message));
     }
     record_share_health(state, share, "success", None, None).await;
     if is_event_stream || looks_like_sse(&text) {
@@ -1476,6 +1471,15 @@ async fn forward_to_router_market_proxy(
     let value =
         serde_json::from_str::<serde_json::Value>(&text).unwrap_or_else(|_| json!({ "raw": text }));
     Ok(UpstreamNonStreamResponse::Json(value))
+}
+
+fn router_market_proxy_error(status: StatusCode, message: String) -> ApiError {
+    match status {
+        StatusCode::BAD_REQUEST => ApiError::bad_request("upstream_bad_request", message),
+        StatusCode::UNAUTHORIZED => ApiError::unauthorized(message),
+        StatusCode::FORBIDDEN => ApiError::forbidden(message),
+        _ => ApiError::service_unavailable(message),
+    }
 }
 
 async fn forward_to_router_market_proxy_stream(
@@ -1511,17 +1515,12 @@ async fn forward_to_router_market_proxy_stream(
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
-        record_share_health(
-            state,
-            share,
-            "error",
-            None,
-            Some(format!("router market proxy returned {status}: {text}")),
-        )
-        .await;
-        return Err(ApiError::service_unavailable(format!(
-            "router market proxy returned {status}: {text}"
-        )));
+        let error_message = format!("router market proxy returned {status}: {text}");
+        let kind = classify_upstream_failure(&error_message);
+        if kind != "bad_request" {
+            record_share_health(state, share, "error", None, Some(error_message.clone())).await;
+        }
+        return Err(router_market_proxy_error(status, error_message));
     }
     record_share_health(state, share, "success", None, None).await;
     Ok(response)
@@ -2260,11 +2259,27 @@ async fn record_share_health(
             ],
         )
         .await;
-    let _ = if status == "success" {
-        state.db().execute(
+    if status == "success" {
+        let _ = state.db().execute(
             "UPDATE router_shares SET last_success_at=?3, last_error_at=NULL, last_error_message=NULL, failure_count=0, cooldown_until=NULL WHERE router_id=?1 AND share_id=?2",
-            vec![crate::db::val(&share.router_id), crate::db::val(&share.share_id), crate::db::val(now)],
-        ).await
+            vec![crate::db::val(&share.router_id), crate::db::val(&share.share_id), crate::db::val(&now)],
+        ).await;
+        crate::router_client::report_share_runtime_state(
+            state,
+            crate::router_client::MarketShareRuntimeState {
+                share_id: share.share_id.clone(),
+                router_id: Some(share.router_id.clone()),
+                scope: "share".to_string(),
+                kind: "cooldown".to_string(),
+                app_type: None,
+                model_id: None,
+                model_name: None,
+                reason_kind: Some("share_cooldown_clear".to_string()),
+                reason: None,
+                failure_count: None,
+                expires_at: Some(now),
+            },
+        );
     } else {
         let current_failures = state
             .db()
@@ -2289,11 +2304,28 @@ async fn record_share_health(
         };
         let cooldown_until =
             (chrono::Utc::now() + chrono::Duration::seconds(cooldown_secs)).to_rfc3339();
-        state.db().execute(
+        let reason = error_message.clone();
+        let _ = state.db().execute(
             "UPDATE router_shares SET last_error_at=?3, last_error_message=?4, failure_count=?5, cooldown_until=?6 WHERE router_id=?1 AND share_id=?2",
-            vec![crate::db::val(&share.router_id), crate::db::val(&share.share_id), crate::db::val(now), crate::db::opt_val(error_message), crate::db::val(failure_count), crate::db::val(cooldown_until)],
-        ).await
-    };
+            vec![crate::db::val(&share.router_id), crate::db::val(&share.share_id), crate::db::val(now), crate::db::opt_val(error_message), crate::db::val(failure_count), crate::db::val(&cooldown_until)],
+        ).await;
+        crate::router_client::report_share_runtime_state(
+            state,
+            crate::router_client::MarketShareRuntimeState {
+                share_id: share.share_id.clone(),
+                router_id: Some(share.router_id.clone()),
+                scope: "share".to_string(),
+                kind: "cooldown".to_string(),
+                app_type: None,
+                model_id: None,
+                model_name: None,
+                reason_kind: Some("share_cooldown".to_string()),
+                reason,
+                failure_count: Some(failure_count),
+                expires_at: Some(cooldown_until),
+            },
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2345,17 +2377,48 @@ fn classify_upstream_failure(message: &str) -> &'static str {
         "upstream_unavailable"
     } else if lower.contains("401") || lower.contains("403") {
         "auth_failed"
-    } else if lower.contains("model")
-        && (lower.contains("not found")
-            || lower.contains("not supported")
-            || lower.contains("unsupported"))
-    {
+    } else if is_parameter_level_bad_request(&lower) {
+        "bad_request"
+    } else if is_model_unsupported_message(&lower) {
         "model_unsupported"
+    } else if lower.contains("400") || lower.contains("bad request") {
+        "bad_request"
     } else if lower.contains("router market proxy failed") {
         "network"
     } else {
         "upstream_error"
     }
+}
+
+fn is_parameter_level_bad_request(lower: &str) -> bool {
+    [
+        "unsupported parameter",
+        "unsupported param",
+        "unknown parameter",
+        "unknown param",
+        "unsupported field",
+        "unknown field",
+        "unrecognized request argument",
+        "unrecognized argument",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn is_model_unsupported_message(lower: &str) -> bool {
+    [
+        "unsupported model",
+        "model unsupported",
+        "model not supported",
+        "model is not supported",
+        "model isn't supported",
+        "model not found",
+        "model does not exist",
+        "model doesn't exist",
+        "invalid model",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn is_retryable_failure(kind: &str) -> bool {
@@ -2387,7 +2450,7 @@ async fn maybe_block_model_share(
     }
     let now = chrono::Utc::now();
     let expires_at = now + chrono::Duration::hours(24);
-    let _ = state.db().execute(
+    let result = state.db().execute(
         r#"
         INSERT INTO model_share_blocks (model_id, router_id, share_id, reason, expires_at, created_at)
         VALUES (?1,?2,?3,?4,?5,?6)
@@ -2403,6 +2466,24 @@ async fn maybe_block_model_share(
             crate::db::val(now.to_rfc3339()),
         ],
     ).await;
+    if result.is_ok() {
+        crate::router_client::report_share_runtime_state(
+            state,
+            crate::router_client::MarketShareRuntimeState {
+                share_id: share.share_id.clone(),
+                router_id: Some(share.router_id.clone()),
+                scope: "model".to_string(),
+                kind: "model_block".to_string(),
+                app_type: Some(share.price.app_type.clone()),
+                model_id: Some(model_id.to_string()),
+                model_name: Some(share.pricing_model.clone()),
+                reason_kind: Some(kind.to_string()),
+                reason: Some(message.chars().take(500).collect::<String>()),
+                failure_count: None,
+                expires_at: Some(expires_at.to_rfc3339()),
+            },
+        );
+    }
 }
 
 async fn api_key_from_headers(
@@ -3194,9 +3275,26 @@ fn chat_completions_body_to_responses(mut value: serde_json::Value) -> serde_jso
                 .entry("max_output_tokens")
                 .or_insert(max_completion_tokens);
         }
+        for field in CHAT_COMPLETIONS_ONLY_FIELDS {
+            object.remove(*field);
+        }
     }
     value
 }
+
+const CHAT_COMPLETIONS_ONLY_FIELDS: &[&str] = &[
+    "frequency_penalty",
+    "presence_penalty",
+    "logit_bias",
+    "logprobs",
+    "top_logprobs",
+    "n",
+    "stop",
+    "response_format",
+    "seed",
+    "stream_options",
+    "user",
+];
 
 fn charge_json(row: crate::db::DbRow) -> serde_json::Value {
     let usage_json = row
@@ -3309,10 +3407,10 @@ fn subdomain_from_url(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        SelectedShare, api_key_allows_model_access, commission_amount, commission_split,
-        inject_openai_stream_usage, is_allowed_router_market_proxy_header, looks_like_sse,
-        parse_gemini_model_action, parse_non_stream_sse_fallback, rendezvous_share_score,
-        share_subdomain, share_weight,
+        SelectedShare, api_key_allows_model_access, chat_completions_body_to_responses,
+        classify_upstream_failure, commission_amount, commission_split, inject_openai_stream_usage,
+        is_allowed_router_market_proxy_header, looks_like_sse, parse_gemini_model_action,
+        parse_non_stream_sse_fallback, rendezvous_share_score, share_subdomain, share_weight,
     };
     use crate::{auth::ApiKeyPrincipal, pricing, usage::UsageProtocol};
     use rust_decimal::Decimal;
@@ -3365,6 +3463,77 @@ mod tests {
             "x-cc-switch-request-id",
         ] {
             assert!(!is_allowed_router_market_proxy_header(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn upstream_unsupported_parameter_is_bad_request_not_model_unsupported() {
+        let message = r#"router market proxy returned 400 Bad Request: {"error":{"code":"cc_switch_upstream_error","message":"OpenAI upstream returned 400 for {\"model\":\"gpt-5.5\"}: Unsupported parameter: frequency_penalty","upstream_status":400}}"#;
+        assert_eq!(classify_upstream_failure(message), "bad_request");
+    }
+
+    #[test]
+    fn upstream_model_unsupported_uses_phrase_match() {
+        assert_eq!(
+            classify_upstream_failure("OpenAI upstream returned 400: model is not supported"),
+            "model_unsupported"
+        );
+        assert_eq!(
+            classify_upstream_failure("OpenAI upstream returned 404: unsupported model gpt-old"),
+            "model_unsupported"
+        );
+    }
+
+    #[test]
+    fn upstream_plain_400_is_bad_request() {
+        assert_eq!(
+            classify_upstream_failure(
+                "router market proxy returned 400 Bad Request: invalid request body"
+            ),
+            "bad_request"
+        );
+    }
+
+    #[test]
+    fn chat_completions_to_responses_strips_chat_only_fields() {
+        let input = json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 100,
+            "temperature": 1,
+            "top_p": 1,
+            "frequency_penalty": 0,
+            "presence_penalty": 0,
+            "logit_bias": {"42": -100},
+            "n": 2,
+            "stop": ["END"],
+            "response_format": {"type": "json_object"},
+            "seed": 123,
+            "stream_options": {"include_usage": true},
+            "user": "user-1"
+        });
+
+        let output = chat_completions_body_to_responses(input);
+
+        assert_eq!(
+            output["input"],
+            json!([{"role": "user", "content": "hello"}])
+        );
+        assert_eq!(output["max_output_tokens"], json!(100));
+        assert!(output.get("messages").is_none());
+        assert!(output.get("max_tokens").is_none());
+        for field in [
+            "frequency_penalty",
+            "presence_penalty",
+            "logit_bias",
+            "n",
+            "stop",
+            "response_format",
+            "seed",
+            "stream_options",
+            "user",
+        ] {
+            assert!(output.get(field).is_none(), "{field}");
         }
     }
 

@@ -1578,7 +1578,7 @@ async fn forward_non_stream_with_retries(
                 .await;
                 clear_sticky_route_for_share(state, sticky_key, share).await;
                 maybe_block_model_share(state, model_id, share, kind, &message).await;
-                maybe_report_router_feedback(state, share, kind).await;
+                maybe_report_router_feedback(state, share, kind, &message).await;
                 let retryable = is_retryable_failure(kind);
                 last_err = Some(err);
                 if !retryable {
@@ -2205,7 +2205,7 @@ async fn forward_stream_with_retries(
                 .await;
                 clear_sticky_route_for_share(state, sticky_key, share).await;
                 maybe_block_model_share(state, model_id, share, kind, &message).await;
-                maybe_report_router_feedback(state, share, kind).await;
+                maybe_report_router_feedback(state, share, kind, &message).await;
                 let retryable = is_retryable_failure(kind);
                 last_err = Some(err);
                 if !retryable {
@@ -2371,6 +2371,8 @@ fn classify_upstream_failure(message: &str) -> &'static str {
     let lower = message.to_ascii_lowercase();
     if lower.contains("timed out") || lower.contains("timeout") {
         "timeout"
+    } else if is_quota_exhausted_message(&lower) {
+        "quota_exhausted"
     } else if lower.contains("429") {
         "rate_limited"
     } else if lower.contains("502") || lower.contains("503") || lower.contains("504") {
@@ -2421,10 +2423,29 @@ fn is_model_unsupported_message(lower: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+fn is_quota_exhausted_message(lower: &str) -> bool {
+    [
+        "quota exceeded",
+        "quota_exceeded",
+        "quota exhausted",
+        "quota_exhausted",
+        "usage limit",
+        "usage_limit",
+        "weekly limit",
+        "monthly limit",
+        "5h",
+        "five hour",
+        "five_hour",
+        "usage credits are required",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 fn is_retryable_failure(kind: &str) -> bool {
     matches!(
         kind,
-        "timeout" | "rate_limited" | "upstream_unavailable" | "network"
+        "timeout" | "rate_limited" | "quota_exhausted" | "upstream_unavailable" | "network"
     )
 }
 
@@ -2432,10 +2453,39 @@ fn is_retryable_failure(kind: &str) -> bool {
 /// every share of the same owner. No-op for other failure kinds; the router
 /// handles auth/model errors on its own (cooldown via `failure_count`) and we
 /// don't want a one-off network blip to penalize an entire owner.
-async fn maybe_report_router_feedback(state: &AppState, share: &SelectedShare, kind: &str) {
-    if kind == "rate_limited" {
-        crate::router_client::report_rate_limited(state, &share.router_id, &share.share_id).await;
+async fn maybe_report_router_feedback(
+    state: &AppState,
+    share: &SelectedShare,
+    kind: &str,
+    message: &str,
+) {
+    match kind {
+        "rate_limited" => {
+            crate::router_client::report_rate_limited(state, &share.router_id, &share.share_id)
+                .await;
+        }
+        "quota_exhausted" => {
+            crate::router_client::report_quota_exhausted(
+                state,
+                &share.router_id,
+                &share.share_id,
+                quota_exhausted_ttl_secs(message),
+            )
+            .await;
+        }
+        _ => {}
     }
+}
+
+fn quota_exhausted_ttl_secs(message: &str) -> u64 {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("5h") || lower.contains("five hour") || lower.contains("five_hour") {
+        return 5 * 60 * 60;
+    }
+    if lower.contains("monthly") || lower.contains("month") {
+        return 31 * 24 * 60 * 60;
+    }
+    7 * 24 * 60 * 60
 }
 
 async fn maybe_block_model_share(
@@ -3409,8 +3459,9 @@ mod tests {
     use super::{
         SelectedShare, api_key_allows_model_access, chat_completions_body_to_responses,
         classify_upstream_failure, commission_amount, commission_split, inject_openai_stream_usage,
-        is_allowed_router_market_proxy_header, looks_like_sse, parse_gemini_model_action,
-        parse_non_stream_sse_fallback, rendezvous_share_score, share_subdomain, share_weight,
+        is_allowed_router_market_proxy_header, is_retryable_failure, looks_like_sse,
+        parse_gemini_model_action, parse_non_stream_sse_fallback, quota_exhausted_ttl_secs,
+        rendezvous_share_score, share_subdomain, share_weight,
     };
     use crate::{auth::ApiKeyPrincipal, pricing, usage::UsageProtocol};
     use rust_decimal::Decimal;
@@ -3492,6 +3543,20 @@ mod tests {
             ),
             "bad_request"
         );
+    }
+
+    #[test]
+    fn upstream_quota_exhausted_is_retryable_long_feedback() {
+        assert_eq!(
+            classify_upstream_failure("OpenAI upstream returned 429: weekly limit exceeded"),
+            "quota_exhausted"
+        );
+        assert!(is_retryable_failure("quota_exhausted"));
+        assert_eq!(
+            quota_exhausted_ttl_secs("monthly quota exhausted"),
+            31 * 24 * 60 * 60
+        );
+        assert_eq!(quota_exhausted_ttl_secs("5h quota exceeded"), 5 * 60 * 60);
     }
 
     #[test]

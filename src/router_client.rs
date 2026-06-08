@@ -206,13 +206,36 @@ pub async fn report_rate_limited(state: &AppState, router_id: &str, share_id: &s
     let state = state.clone();
     let share_id = share_id.to_string();
     tokio::spawn(async move {
-        if let Err(err) = report_rate_limited_inner(&state, &share_id).await {
+        if let Err(err) = report_feedback_inner(&state, &share_id, "rate_limited", None).await {
             tracing::warn!(%share_id, error = %err, "router feedback POST failed");
         }
     });
 }
 
-async fn report_rate_limited_inner(state: &AppState, share_id: &str) -> Result<(), ApiError> {
+pub async fn report_quota_exhausted(
+    state: &AppState,
+    router_id: &str,
+    share_id: &str,
+    ttl_secs: u64,
+) {
+    let _ = router_id;
+    let state = state.clone();
+    let share_id = share_id.to_string();
+    tokio::spawn(async move {
+        if let Err(err) =
+            report_feedback_inner(&state, &share_id, "quota_exhausted", Some(ttl_secs)).await
+        {
+            tracing::warn!(%share_id, error = %err, "router quota feedback POST failed");
+        }
+    });
+}
+
+async fn report_feedback_inner(
+    state: &AppState,
+    share_id: &str,
+    kind: &str,
+    ttl_secs: Option<u64>,
+) -> Result<(), ApiError> {
     let access_token = crate::router_account::access_token(&state.config)
         .await
         .map_err(|e| ApiError::service_unavailable(format!("router login required: {e}")))?;
@@ -220,10 +243,13 @@ async fn report_rate_limited_inner(state: &AppState, share_id: &str) -> Result<(
         "{}/v1/market/shares/feedback",
         state.config.router_api_base_url.trim_end_matches('/')
     );
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "shareId": share_id,
-        "kind": "rate_limited",
+        "kind": kind,
     });
+    if let Some(ttl_secs) = ttl_secs {
+        body["ttlSecs"] = serde_json::json!(ttl_secs);
+    }
     let response = state
         .http
         .post(url)

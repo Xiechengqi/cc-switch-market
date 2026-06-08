@@ -249,6 +249,12 @@ fn status_code_for_failure(message: &str) -> u16 {
     if lower.contains("429")
         || lower.contains("rate limit")
         || lower.contains("rate_limit")
+        || lower.contains("quota exceeded")
+        || lower.contains("quota_exceeded")
+        || lower.contains("quota exhausted")
+        || lower.contains("quota_exhausted")
+        || lower.contains("usage limit")
+        || lower.contains("usage_limit")
         || lower.contains("usage credits are required")
     {
         429

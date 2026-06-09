@@ -243,6 +243,23 @@ async fn additive_migrations(db: &Db) -> anyhow::Result<()> {
           PRIMARY KEY(api_key_id, router_id, share_id)
         );
         CREATE INDEX IF NOT EXISTS idx_market_api_key_share_allowlist_key ON market_api_key_share_allowlist(api_key_id);
+        CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_wallet_accounts_type ON wallet_accounts(account_type);
+        CREATE INDEX IF NOT EXISTS idx_ledger_from_account_created ON ledger_entries(from_account_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_ledger_to_account_created ON ledger_entries(to_account_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_topup_orders_created_at ON topup_orders(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_topup_orders_status_created ON topup_orders(status, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_topup_orders_status_paid ON topup_orders(status, paid_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_processed_webhooks_created_at ON processed_webhooks(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_router_shares_last_seen ON router_shares(last_seen_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_request_charges_created_at ON request_charges(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_request_charges_status_created ON request_charges(status, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_request_charges_user_created ON request_charges(user_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_tickets_updated_at ON tickets(updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_tickets_status_updated ON tickets(status, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_ticket_messages_ticket_created ON ticket_messages(ticket_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_admin_audit_created_at ON admin_audit(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_payout_requests_status_created ON payout_requests(status, created_at DESC);
         CREATE TABLE IF NOT EXISTS app_settings (
           key TEXT PRIMARY KEY,
           value TEXT NOT NULL,
@@ -1231,6 +1248,7 @@ CREATE TABLE IF NOT EXISTS users (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at DESC);
 
 CREATE TABLE IF NOT EXISTS health_checks (
   id TEXT PRIMARY KEY,
@@ -1286,6 +1304,7 @@ CREATE TABLE IF NOT EXISTS wallet_accounts (
 CREATE UNIQUE INDEX IF NOT EXISTS uq_wallet_user_account ON wallet_accounts(account_type, currency, owner_user_id) WHERE owner_user_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_wallet_email_account ON wallet_accounts(account_type, currency, owner_email) WHERE owner_email IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_wallet_platform_account ON wallet_accounts(account_type, currency) WHERE owner_user_id IS NULL AND owner_email IS NULL;
+CREATE INDEX IF NOT EXISTS idx_wallet_accounts_type ON wallet_accounts(account_type);
 
 CREATE TABLE IF NOT EXISTS ledger_entries (
   id TEXT PRIMARY KEY,
@@ -1305,6 +1324,8 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_reference ON ledger_entries(reference_type, reference_id);
 CREATE INDEX IF NOT EXISTS idx_ledger_created_at ON ledger_entries(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ledger_from_account_created ON ledger_entries(from_account_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ledger_to_account_created ON ledger_entries(to_account_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS processed_webhooks (
   provider TEXT NOT NULL,
@@ -1318,6 +1339,7 @@ CREATE TABLE IF NOT EXISTS processed_webhooks (
   created_at TEXT NOT NULL,
   PRIMARY KEY(provider, event_id)
 );
+CREATE INDEX IF NOT EXISTS idx_processed_webhooks_created_at ON processed_webhooks(created_at DESC);
 
 CREATE TABLE IF NOT EXISTS topup_orders (
   id TEXT PRIMARY KEY,
@@ -1338,6 +1360,9 @@ CREATE TABLE IF NOT EXISTS topup_orders (
   paid_at TEXT,
   refunded_at TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_topup_orders_created_at ON topup_orders(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_topup_orders_status_created ON topup_orders(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_topup_orders_status_paid ON topup_orders(status, paid_at DESC);
 
 CREATE TABLE IF NOT EXISTS model_prices (
   id TEXT PRIMARY KEY,
@@ -1455,6 +1480,7 @@ CREATE TABLE IF NOT EXISTS router_shares (
   last_seen_at TEXT NOT NULL,
   PRIMARY KEY(router_id, share_id)
 );
+CREATE INDEX IF NOT EXISTS idx_router_shares_last_seen ON router_shares(last_seen_at DESC);
 
 CREATE TABLE IF NOT EXISTS router_share_model_support (
   router_id TEXT NOT NULL,
@@ -1588,6 +1614,9 @@ CREATE TABLE IF NOT EXISTS request_charges (
   created_at TEXT NOT NULL,
   settled_at TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_request_charges_created_at ON request_charges(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_request_charges_status_created ON request_charges(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_request_charges_user_created ON request_charges(user_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS request_idempotency (
   user_id TEXT NOT NULL REFERENCES users(id),
@@ -1636,6 +1665,7 @@ CREATE TABLE IF NOT EXISTS payout_requests (
   cancelled_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_payout_owner_status ON payout_requests(owner_email, status);
+CREATE INDEX IF NOT EXISTS idx_payout_requests_status_created ON payout_requests(status, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS payout_attempts (
   id TEXT PRIMARY KEY,
@@ -1698,6 +1728,8 @@ CREATE TABLE IF NOT EXISTS tickets (
   updated_at TEXT NOT NULL,
   closed_at TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_tickets_updated_at ON tickets(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tickets_status_updated ON tickets(status, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS ticket_messages (
   id TEXT PRIMARY KEY,
@@ -1708,6 +1740,7 @@ CREATE TABLE IF NOT EXISTS ticket_messages (
   internal_note INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_ticket_messages_ticket_created ON ticket_messages(ticket_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS ticket_attachments (
   id TEXT PRIMARY KEY,
@@ -1748,6 +1781,7 @@ CREATE TABLE IF NOT EXISTS admin_audit (
   metadata_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_admin_audit_created_at ON admin_audit(created_at DESC);
 
 CREATE TABLE IF NOT EXISTS app_settings (
   key TEXT PRIMARY KEY,

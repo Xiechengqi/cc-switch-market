@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Banknote, FileText, Paperclip, Wallet, X } from "lucide-react";
 import { useMarketAuth } from "@/components/auth";
 import { PageHeader } from "@/components/ui/PageHeader";
@@ -12,7 +12,7 @@ import { EmptyState } from "@/components/ui/EmptyState";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { MoneyAmount } from "@/components/ui/MoneyAmount";
 import { useToast } from "@/components/ui/Toast";
-import { apiGet, apiGetAllItems, apiPost, apiPutBytes } from "@/lib/client-api";
+import { apiGet, apiGetPage, apiPost, apiPutBytes } from "@/lib/client-api";
 import { useLocale } from "@/components/language-provider";
 import { copy } from "@/lib/copy";
 import { commissionText, usePublicConfig } from "@/lib/public-config";
@@ -76,6 +76,68 @@ function ClaimDataTable<T>(props: DataTableProps<T>) {
         rowsPerPage: locale === "zh" ? "每页" : "Rows",
       }}
     />
+  );
+}
+
+type PagedRows<T> = {
+  items: T[] | null;
+  hasMore: boolean;
+  loadingMore: boolean;
+  loadMore: () => void;
+};
+
+function usePagedRows<T>(path: string, limit = 50): PagedRows<T> {
+  const [items, setItems] = useState<T[] | null>(null);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+
+  const loadPage = useCallback(async (cursor: string | null, append: boolean) => {
+    if (append) setLoadingMore(true);
+    else setItems(null);
+    try {
+      const page = await apiGetPage<T>(path, { limit, cursor });
+      setItems((prev) => append ? [...(prev ?? []), ...(page.items ?? [])] : (page.items ?? []));
+      setNextCursor(page.nextCursor ?? null);
+      setHasMore(Boolean(page.hasMore));
+    } catch {
+      if (!append) setItems([]);
+      setNextCursor(null);
+      setHasMore(false);
+    } finally {
+      if (append) setLoadingMore(false);
+    }
+  }, [limit, path]);
+
+  const reload = useCallback(() => { void loadPage(null, false); }, [loadPage]);
+  const loadMore = useCallback(() => {
+    if (!hasMore || loadingMore) return;
+    void loadPage(nextCursor, true);
+  }, [hasMore, loadPage, loadingMore, nextCursor]);
+
+  useEffect(() => { reload(); }, [reload]);
+
+  return { items, hasMore, loadingMore, loadMore };
+}
+
+function PagedClaimDataTable<T>({ page, ...props }: Omit<DataTableProps<T>, "rows" | "loading"> & { page: PagedRows<T> }) {
+  const { locale } = useLocale();
+  return (
+    <div className="grid gap-3">
+      <ClaimDataTable {...props} rows={page.items ?? []} loading={page.items === null} />
+      {page.hasMore && (
+        <div className="flex justify-center">
+          <button
+            type="button"
+            onClick={page.loadMore}
+            disabled={page.loadingMore}
+            className="rounded-full border-2 border-slate-800 bg-white px-5 py-2 text-sm font-bold lift disabled:opacity-50"
+          >
+            {page.loadingMore ? (locale === "zh" ? "加载中..." : "Loading...") : (locale === "zh" ? "加载更多" : "Load more")}
+          </button>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -567,15 +629,11 @@ export function ImageAttachmentGrid({ attachments }: { attachments: ImageAttachm
 function PayoutTable() {
   const { locale } = useLocale();
   const c = copy[locale].claim;
-  const [items, setItems] = useState<PayoutItem[] | null>(null);
+  const page = usePagedRows<PayoutItem>("/v1/provider/claim/payouts");
   const formatDate = useDateTimeFormatter();
-  useEffect(() => {
-    apiGetAllItems<PayoutItem>("/v1/provider/claim/payouts").then(setItems).catch(() => setItems([]));
-  }, []);
   return (
-    <ClaimDataTable
-      rows={items ?? []}
-      loading={items === null}
+    <PagedClaimDataTable
+      page={page}
       rowKey={(r, i) => String(r.id ?? i)}
       empty={<EmptyState shape="square" title={c.payoutsEmptyTitle} hint={c.payoutsEmptyHint} />}
       columns={[
@@ -651,14 +709,10 @@ function payoutProof(item: PayoutItem) {
 function EarningsTable() {
   const { locale } = useLocale();
   const c = copy[locale].claim;
-  const [items, setItems] = useState<Record<string, unknown>[] | null>(null);
-  useEffect(() => {
-    apiGetAllItems<Record<string, unknown>>("/v1/provider/earnings").then(setItems).catch(() => setItems([]));
-  }, []);
+  const page = usePagedRows<Record<string, unknown>>("/v1/provider/earnings");
   return (
-    <ClaimDataTable
-      rows={items ?? []}
-      loading={items === null}
+    <PagedClaimDataTable
+      page={page}
       rowKey={(r, i) => String(r.request_id ?? i)}
       empty={<EmptyState shape="circle" title={c.earningsEmptyTitle} hint={c.earningsEmptyHint} />}
       columns={[

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { useForm } from "react-hook-form";
 import {
   LayoutDashboard,
@@ -40,7 +40,7 @@ import { useToast } from "@/components/ui/Toast";
 import { Switch } from "@/components/shadcn/switch";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/shadcn/tooltip";
 import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/shadcn/form";
-import { apiDelete, apiGet, apiGetAllItems, apiPatchJson, apiPost, apiPutBytes, apiPutJson } from "@/lib/client-api";
+import { apiDelete, apiGet, apiGetPage, apiPatchJson, apiPost, apiPutBytes, apiPutJson } from "@/lib/client-api";
 import { readAnnouncements, type SiteAnnouncement, writeAnnouncements } from "@/lib/site-announcements";
 import { useLocale } from "@/components/language-provider";
 import { copy } from "@/lib/copy";
@@ -60,6 +60,69 @@ function AdminDataTable<T>(props: DataTableProps<T>) {
       pageSize={publicConfig.adminTablePageSize}
       paginationLabels={{ previous: locale === "zh" ? "上一页" : "Prev", next: locale === "zh" ? "下一页" : "Next" }}
     />
+  );
+}
+
+type PagedRows<T> = {
+  items: T[] | null;
+  hasMore: boolean;
+  loadingMore: boolean;
+  reload: () => void;
+  loadMore: () => void;
+};
+
+function usePagedRows<T>(path: string, limit = 100): PagedRows<T> {
+  const [items, setItems] = useState<T[] | null>(null);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+
+  const loadPage = useCallback(async (cursor: string | null, append: boolean) => {
+    if (append) setLoadingMore(true);
+    else setItems(null);
+    try {
+      const page = await apiGetPage<T>(path, { limit, cursor });
+      setItems((prev) => append ? [...(prev ?? []), ...(page.items ?? [])] : (page.items ?? []));
+      setNextCursor(page.nextCursor ?? null);
+      setHasMore(Boolean(page.hasMore));
+    } catch {
+      if (!append) setItems([]);
+      setNextCursor(null);
+      setHasMore(false);
+    } finally {
+      if (append) setLoadingMore(false);
+    }
+  }, [limit, path]);
+
+  const reload = useCallback(() => { void loadPage(null, false); }, [loadPage]);
+  const loadMore = useCallback(() => {
+    if (!hasMore || loadingMore) return;
+    void loadPage(nextCursor, true);
+  }, [hasMore, loadPage, loadingMore, nextCursor]);
+
+  useEffect(() => { reload(); }, [reload]);
+
+  return { items, hasMore, loadingMore, reload, loadMore };
+}
+
+function PagedAdminDataTable<T>({ page, ...props }: Omit<DataTableProps<T>, "rows" | "loading"> & { page: PagedRows<T> }) {
+  const { locale } = useLocale();
+  return (
+    <div className="grid gap-3">
+      <AdminDataTable {...props} rows={page.items ?? []} loading={page.items === null} />
+      {page.hasMore && (
+        <div className="flex justify-center">
+          <button
+            type="button"
+            onClick={page.loadMore}
+            disabled={page.loadingMore}
+            className="rounded-full border-2 border-slate-800 bg-white px-5 py-2 text-sm font-bold lift disabled:opacity-50"
+          >
+            {page.loadingMore ? (locale === "zh" ? "加载中..." : "Loading...") : (locale === "zh" ? "加载更多" : "Load more")}
+          </button>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -114,15 +177,11 @@ function LedgerLight() {
 function Overview() {
   const { locale } = useLocale();
   const c = copy[locale].admin;
-  const [tickets, setTickets] = useState<AnyRow[] | null>(null);
   const [overview, setOverview] = useState<AnyRow | null>(null);
 
   useEffect(() => {
-    apiGetAllItems<AnyRow>("/v1/admin/tickets").then(setTickets).catch(() => setTickets([]));
-    apiGet<AnyRow>("/v1/admin/money/overview").then(setOverview).catch(() => setOverview({ ledgerOk: false }));
+    apiGet<AnyRow>("/v1/admin/summary").then(setOverview).catch(() => setOverview({ ledgerOk: false }));
   }, []);
-
-  const openTickets = (tickets ?? []).filter((t) => ["open", "waiting_admin"].includes(String(t.status))).length;
 
   return (
     <div className="grid gap-6">
@@ -131,7 +190,7 @@ function Overview() {
         <StatCard label={c.overview.todayUsage} value={formatAdminUsd(overview?.todayUsageUsd)} color="pink" icon={<Receipt size={16} />} loading={!overview} />
         <StatCard label={c.overview.needsReview} value={Number(overview?.needsReviewCharges ?? 0)} color="amber" icon={<AlertTriangle size={16} />} loading={!overview} />
         <StatCard label={c.overview.pendingPayouts} value={Number(overview?.pendingPayouts ?? 0)} color="emerald" icon={<Banknote size={16} />} loading={!overview} />
-        <StatCard label={c.overview.openTickets} value={openTickets} color="violet" icon={<LifeBuoy size={16} />} loading={!tickets} />
+        <StatCard label={c.overview.openTickets} value={Number(overview?.openTickets ?? 0)} color="violet" icon={<LifeBuoy size={16} />} loading={!overview} />
         <StatCard label={c.overview.ledger} value={overview?.ledgerOk ? c.overview.ledgerOk : overview ? c.overview.ledgerBad : <Skeleton />} color={overview?.ledgerOk ? "emerald" : "pink"} icon={<ShieldCheck size={16} />} loading={!overview} />
       </div>
     </div>
@@ -139,19 +198,15 @@ function Overview() {
 }
 
 function UsersTab() {
-  const [items, setItems] = useState<AnyRow[] | null>(null);
+  const page = usePagedRows<AnyRow>("/v1/admin/users");
   const [adjustTarget, setAdjustTarget] = useState<AnyRow | null>(null);
   const toast = useToast();
   const formatDate = useDateTimeFormatter();
 
-  function reload() { apiGetAllItems<AnyRow>("/v1/admin/users").then(setItems).catch(() => setItems([])); }
-  useEffect(() => { reload(); }, []);
-
   return (
     <div className="grid gap-4">
-      <AdminDataTable
-        rows={items ?? []}
-        loading={items === null}
+      <PagedAdminDataTable
+        page={page}
         rowKey={(r, i) => String(r.id ?? i)}
         empty={<EmptyState shape="circle" title="还没有用户" />}
         columns={[
@@ -164,7 +219,7 @@ function UsersTab() {
           ) }
         ]}
       />
-      <UserAdjustModal target={adjustTarget} onClose={() => setAdjustTarget(null)} onDone={() => { reload(); toast.push({ variant: "success", title: "已调账" }); }} />
+      <UserAdjustModal target={adjustTarget} onClose={() => setAdjustTarget(null)} onDone={() => { page.reload(); toast.push({ variant: "success", title: "已调账" }); }} />
     </div>
   );
 }
@@ -252,17 +307,14 @@ function UserAdjustModal({ target, onClose, onDone }: { target: AnyRow | null; o
 }
 
 function TopupsTab() {
-  const [items, setItems] = useState<AnyRow[] | null>(null);
+  const page = usePagedRows<AnyRow>("/v1/admin/topups");
   const [refundTarget, setRefundTarget] = useState<AnyRow | null>(null);
   const [detailTarget, setDetailTarget] = useState<AnyRow | null>(null);
   const formatDate = useDateTimeFormatter();
-  function reload() { apiGetAllItems<AnyRow>("/v1/admin/topups").then(setItems).catch(() => setItems([])); }
-  useEffect(() => { reload(); }, []);
   return (
     <div className="grid gap-4">
-      <AdminDataTable
-        rows={items ?? []}
-        loading={items === null}
+      <PagedAdminDataTable
+        page={page}
         rowKey={(r, i) => String(r.id ?? i)}
         empty={<EmptyState shape="square" title="还没有充值订单" />}
         columns={[
@@ -288,7 +340,7 @@ function TopupsTab() {
         ]}
       />
       <TopupDetailModal target={detailTarget} onClose={() => setDetailTarget(null)} />
-      <RefundTopupModal target={refundTarget} onClose={() => setRefundTarget(null)} onDone={reload} />
+      <RefundTopupModal target={refundTarget} onClose={() => setRefundTarget(null)} onDone={page.reload} />
     </div>
   );
 }
@@ -695,15 +747,33 @@ function discountedModelPrice(value: unknown, target: AnyRow | null): string {
 function ModelRoutingModal({ open, target, onClose, onDone }: { open: boolean; target: AnyRow | null; onClose: () => void; onDone: () => void }) {
   const toast = useToast();
   const [shares, setShares] = useState<AnyRow[]>([]);
+  const [sharesNextCursor, setSharesNextCursor] = useState<string | null>(null);
+  const [sharesHasMore, setSharesHasMore] = useState(false);
+  const [sharesLoadingMore, setSharesLoadingMore] = useState(false);
   const routing = target?.routing as AnyRow | undefined;
   const existing = (routing?.shares as AnyRow[] | undefined) ?? [];
   const [mode, setMode] = useState("all");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [previewModel, setPreviewModel] = useState("");
   const [preview, setPreview] = useState<AnyRow | null>(null);
+  async function loadShares(cursor: string | null, append: boolean) {
+    setSharesLoadingMore(append);
+    try {
+      const page = await apiGetPage<AnyRow>("/v1/admin/shares", { limit: 200, cursor });
+      setShares((prev) => append ? [...prev, ...(page.items ?? [])] : (page.items ?? []));
+      setSharesNextCursor(page.nextCursor ?? null);
+      setSharesHasMore(Boolean(page.hasMore));
+    } catch {
+      if (!append) setShares([]);
+      setSharesNextCursor(null);
+      setSharesHasMore(false);
+    } finally {
+      setSharesLoadingMore(false);
+    }
+  }
   useEffect(() => {
     if (!open) return;
-    apiGetAllItems<AnyRow>("/v1/admin/shares").then(setShares).catch(() => setShares([]));
+    void loadShares(null, false);
     setMode(String(routing?.mode ?? "all"));
     setSelected(new Set(existing.map((s) => `${String(s.router_id)}:${String(s.share_id)}`)));
     setPreviewModel(String(target?.model_pattern ?? "").replace(/\*$/, ""));
@@ -763,6 +833,16 @@ function ModelRoutingModal({ open, target, onClose, onDone }: { open: boolean; t
               </label>
             );
           })}
+          {sharesHasMore && (
+            <button
+              type="button"
+              onClick={() => loadShares(sharesNextCursor, true)}
+              disabled={sharesLoadingMore}
+              className="mt-2 w-full rounded-2xl border-2 border-slate-800 bg-white px-4 py-2 text-sm font-bold lift disabled:opacity-50"
+            >
+              {sharesLoadingMore ? "加载中..." : "加载更多 share"}
+            </button>
+          )}
         </div>
         <div className="rounded-3xl border-2 border-slate-800 bg-emerald-50 p-4">
           <div className="flex flex-wrap items-end gap-3">
@@ -813,18 +893,16 @@ function Field({ label, children, full }: { label: string; children: ReactNode; 
 
 function SharesTab() {
   const toast = useToast();
-  const [items, setItems] = useState<AnyRow[] | null>(null);
+  const page = usePagedRows<AnyRow>("/v1/admin/shares");
   const [syncing, setSyncing] = useState(false);
   const [updatingKey, setUpdatingKey] = useState<string | null>(null);
   const formatDate = useDateTimeFormatter();
-  function reload() { apiGetAllItems<AnyRow>("/v1/admin/shares").then(setItems).catch(() => setItems([])); }
-  useEffect(() => { reload(); }, []);
   async function sync() {
     setSyncing(true);
     try {
       const value = await apiPost<{ synced?: number }>("/v1/admin/shares/sync", {});
       toast.push({ variant: "success", title: `已同步 ${value.synced ?? 0} 个 share` });
-      reload();
+      page.reload();
     } catch (err) {
       toast.push({ variant: "error", title: "同步失败", description: String(err).replace(/^Error:\s*/, "") });
     } finally {
@@ -849,7 +927,7 @@ function SharesTab() {
         await apiDelete(`/v1/admin/share-capability-blocks/${encodeURIComponent(routerId)}/${encodeURIComponent(shareId)}/${encodeURIComponent(capability)}`);
       }
       toast.push({ variant: "success", title: blocked ? "已加入黑名单" : "已解除黑名单" });
-      reload();
+      page.reload();
     } catch (err) {
       toast.push({ variant: "error", title: "更新失败", description: String(err).replace(/^Error:\s*/, "") });
     } finally {
@@ -863,9 +941,8 @@ function SharesTab() {
           <RotateCw size={16} className={syncing ? "animate-spin" : ""} /> 同步 Router Shares
         </button>
       </div>
-      <AdminDataTable
-        rows={items ?? []}
-        loading={items === null}
+      <PagedAdminDataTable
+        page={page}
         rowKey={(r, i) => String(r.share_id ?? i)}
         empty={<EmptyState shape="circle" title="暂无 share 缓存" hint="点击「同步 Router Shares」从 router 拉取" />}
         columns={[
@@ -963,19 +1040,16 @@ function ShareCapabilityActions({ row, updatingKey, onToggle }: { row: AnyRow; u
 }
 
 function ChargesTab() {
-  const [items, setItems] = useState<AnyRow[] | null>(null);
+  const page = usePagedRows<AnyRow>("/v1/admin/charges");
   const [settleTarget, setSettleTarget] = useState<AnyRow | null>(null);
   const [releaseTarget, setReleaseTarget] = useState<AnyRow | null>(null);
   const [detailTarget, setDetailTarget] = useState<AnyRow | null>(null);
   const formatDate = useDateTimeFormatter();
-  function reload() { apiGetAllItems<AnyRow>("/v1/admin/charges").then(setItems).catch(() => setItems([])); }
-  useEffect(() => { reload(); }, []);
-  const sortedItems = (items ?? []).slice().sort(compareChargeRows);
+  const sortedPage = { ...page, items: page.items ? page.items.slice().sort(compareChargeRows) : null };
   return (
     <div className="grid gap-4">
-      <AdminDataTable
-        rows={sortedItems}
-        loading={items === null}
+      <PagedAdminDataTable
+        page={sortedPage}
         rowKey={(r, i) => String(r.id ?? i)}
         rowClassName={(r) => {
           const status = String(r.status);
@@ -1006,8 +1080,8 @@ function ChargesTab() {
         ]}
       />
       <ChargeReviewDetailModal target={detailTarget} onClose={() => setDetailTarget(null)} />
-      <SettleManualModal target={settleTarget} onClose={() => setSettleTarget(null)} onDone={reload} />
-      <ReleaseChargeModal target={releaseTarget} onClose={() => setReleaseTarget(null)} onDone={reload} />
+      <SettleManualModal target={settleTarget} onClose={() => setSettleTarget(null)} onDone={page.reload} />
+      <ReleaseChargeModal target={releaseTarget} onClose={() => setReleaseTarget(null)} onDone={page.reload} />
     </div>
   );
 }
@@ -1391,20 +1465,16 @@ function MoneyOverviewTab() {
 }
 
 function PayoutsTab() {
-  const [items, setItems] = useState<AnyRow[] | null>(null);
+  const page = usePagedRows<AnyRow>("/v1/admin/payout-requests");
   const [executeTarget, setExecuteTarget] = useState<AnyRow | null>(null);
   const [paidTarget, setPaidTarget] = useState<AnyRow | null>(null);
   const [failedTarget, setFailedTarget] = useState<AnyRow | null>(null);
   const [cancelTarget, setCancelTarget] = useState<AnyRow | null>(null);
 
-  function reload() { apiGetAllItems<AnyRow>("/v1/admin/payout-requests").then(setItems).catch(() => setItems([])); }
-  useEffect(() => { reload(); }, []);
-
   return (
     <div className="grid gap-4">
-      <AdminDataTable
-        rows={items ?? []}
-        loading={items === null}
+      <PagedAdminDataTable
+        page={page}
         rowKey={(r, i) => String(r.id ?? i)}
         empty={<EmptyState shape="square" title="还没有提现请求" />}
         columns={[
@@ -1435,10 +1505,10 @@ function PayoutsTab() {
           } }
         ]}
       />
-      <ConfirmModal target={executeTarget} onClose={() => setExecuteTarget(null)} title="执行 Gate.io 提现" reasonPlaceholder="备注（可选）" requireReason={false} confirmLabel="执行" onConfirm={async (r, reason) => { await apiPost(`/v1/admin/payout-requests/${r.id}/execute-gateio`, { reason }); reload(); }} />
-      <PaidModal target={paidTarget} onClose={() => setPaidTarget(null)} onDone={reload} />
-      <ReasonModal target={failedTarget} onClose={() => setFailedTarget(null)} title="标记失败" reasonPlaceholder="失败原因" confirmLabel="标记失败" onConfirm={async (r, reason) => { await apiPost(`/v1/admin/payout-requests/${r.id}/mark-failed`, { reason }); reload(); }} />
-      <ConfirmModal target={cancelTarget} onClose={() => setCancelTarget(null)} title="取消提现" reasonPlaceholder="取消原因" requireReason confirmLabel="取消提现" onConfirm={async (r, reason) => { await apiPost(`/v1/admin/payout-requests/${r.id}/cancel`, { reason }); reload(); }} />
+      <ConfirmModal target={executeTarget} onClose={() => setExecuteTarget(null)} title="执行 Gate.io 提现" reasonPlaceholder="备注（可选）" requireReason={false} confirmLabel="执行" onConfirm={async (r, reason) => { await apiPost(`/v1/admin/payout-requests/${r.id}/execute-gateio`, { reason }); page.reload(); }} />
+      <PaidModal target={paidTarget} onClose={() => setPaidTarget(null)} onDone={page.reload} />
+      <ReasonModal target={failedTarget} onClose={() => setFailedTarget(null)} title="标记失败" reasonPlaceholder="失败原因" confirmLabel="标记失败" onConfirm={async (r, reason) => { await apiPost(`/v1/admin/payout-requests/${r.id}/mark-failed`, { reason }); page.reload(); }} />
+      <ConfirmModal target={cancelTarget} onClose={() => setCancelTarget(null)} title="取消提现" reasonPlaceholder="取消原因" requireReason confirmLabel="取消提现" onConfirm={async (r, reason) => { await apiPost(`/v1/admin/payout-requests/${r.id}/cancel`, { reason }); page.reload(); }} />
     </div>
   );
 }
@@ -1530,7 +1600,7 @@ function ConfirmModal({ target, onClose, title, reasonPlaceholder, requireReason
 
 function TicketsTab() {
   const { locale } = useLocale();
-  const [items, setItems] = useState<AnyRow[] | null>(null);
+  const page = usePagedRows<AnyRow>("/v1/admin/tickets");
   const [activeId, setActiveId] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState("all");
   const [priorityFilter, setPriorityFilter] = useState("all");
@@ -1539,10 +1609,8 @@ function TicketsTab() {
   const [keyword, setKeyword] = useState("");
   const [listScrollTop, setListScrollTop] = useState(0);
   const formatDate = useDateTimeFormatter();
-  function reload() { apiGetAllItems<AnyRow>("/v1/admin/tickets").then(setItems).catch(() => setItems([])); }
-  useEffect(() => { reload(); }, []);
 
-  const sortedFilteredItems = (items ?? [])
+  const sortedFilteredItems = (page.items ?? [])
     .filter((t) => {
       const status = String(t.status ?? "open");
       const priority = String(t.priority ?? "normal");
@@ -1631,9 +1699,9 @@ function TicketsTab() {
 
       {!activeId ? (
         <div className="grid gap-3">
-          {items === null && <Skeleton className="h-20 w-full rounded-2xl" />}
-          {items && sortedFilteredItems.length === 0 && <EmptyState shape="circle" title="没有匹配工单" hint="试试修改筛选条件" />}
-          {items && sortedFilteredItems.map((t) => {
+          {page.items === null && <Skeleton className="h-20 w-full rounded-2xl" />}
+          {page.items && sortedFilteredItems.length === 0 && <EmptyState shape="circle" title="没有匹配工单" hint="试试修改筛选条件" />}
+          {page.items && sortedFilteredItems.map((t) => {
             const status = String(t.status ?? "open");
             const priority = String(t.priority ?? "normal");
             const waitingWho = waitingForLabel(status, locale);
@@ -1658,6 +1726,18 @@ function TicketsTab() {
               </button>
             );
           })}
+          {page.hasMore && (
+            <div className="flex justify-center">
+              <button
+                type="button"
+                onClick={page.loadMore}
+                disabled={page.loadingMore}
+                className="rounded-full border-2 border-slate-800 bg-white px-5 py-2 text-sm font-bold lift disabled:opacity-50"
+              >
+                {page.loadingMore ? "加载中..." : "加载更多工单"}
+              </button>
+            </div>
+          )}
         </div>
       ) : (
         <div className="sticker bg-white p-6 min-h-[300px]">
@@ -1678,7 +1758,7 @@ function TicketsTab() {
               </button>
             </div>
           </div>
-          <AdminTicketDetails id={activeId} onChanged={reload} />
+          <AdminTicketDetails id={activeId} onChanged={page.reload} />
         </div>
       )}
     </div>
@@ -3249,14 +3329,12 @@ function MoneyEventsTab() { return <SimpleTable path="/v1/admin/money-events" em
 function AuditTab() { return <SimpleTable path="/v1/admin/audit" empty="尚无审计记录" />; }
 
 function SimpleTable({ path, empty }: { path: string; empty: string }) {
-  const [items, setItems] = useState<AnyRow[] | null>(null);
+  const page = usePagedRows<AnyRow>(path);
   const formatDate = useDateTimeFormatter();
-  useEffect(() => { apiGetAllItems<AnyRow>(path).then(setItems).catch(() => setItems([])); }, [path]);
-  const columns = inferColumns(items?.[0], formatDate);
+  const columns = inferColumns(page.items?.[0], formatDate);
   return (
-    <AdminDataTable
-      rows={items ?? []}
-      loading={items === null}
+    <PagedAdminDataTable
+      page={page}
       rowKey={(r, i) => String(r.id ?? r.event_id ?? r.request_id ?? i)}
       empty={<EmptyState shape="circle" title={empty} />}
       columns={columns}

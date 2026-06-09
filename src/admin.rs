@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, fs};
+use std::{
+    collections::BTreeMap,
+    fs,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 use anyhow::Context;
 use axum::{
@@ -23,6 +28,46 @@ use crate::{
 pub struct LimitQuery {
     pub limit: Option<i64>,
     pub cursor: Option<String>,
+}
+
+struct CachedJson {
+    expires_at: Instant,
+    value: serde_json::Value,
+}
+
+static LEDGER_REPORT_CACHE: OnceLock<Mutex<Option<CachedJson>>> = OnceLock::new();
+static ADMIN_SUMMARY_CACHE: OnceLock<Mutex<Option<CachedJson>>> = OnceLock::new();
+
+async fn cached_ledger_report(state: &AppState) -> Result<serde_json::Value, ApiError> {
+    cached_json(&LEDGER_REPORT_CACHE, Duration::from_secs(30), || async {
+        ledger::consistency_report(state.db()).await
+    })
+    .await
+}
+
+async fn cached_json<F, Fut>(
+    cache: &OnceLock<Mutex<Option<CachedJson>>>,
+    ttl: Duration,
+    build: F,
+) -> Result<serde_json::Value, ApiError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<serde_json::Value, ApiError>>,
+{
+    let now = Instant::now();
+    if let Ok(guard) = cache.get_or_init(|| Mutex::new(None)).lock() {
+        if let Some(cached) = guard.as_ref().filter(|cached| cached.expires_at > now) {
+            return Ok(cached.value.clone());
+        }
+    }
+    let value = build().await?;
+    if let Ok(mut guard) = cache.get_or_init(|| Mutex::new(None)).lock() {
+        *guard = Some(CachedJson {
+            expires_at: Instant::now() + ttl,
+            value: value.clone(),
+        });
+    }
+    Ok(value)
 }
 
 async fn json_page(
@@ -1060,7 +1105,7 @@ pub async fn money_overview(
     }
     let today = admin_today_start_utc(&state).await?;
     let router_commission_owner_email = state.config.router_commission_owner_email();
-    let ledger_report = ledger::consistency_report(state.db()).await?;
+    let ledger_report = cached_ledger_report(&state).await?;
     Ok(Json(serde_json::json!({
         "ledgerOk": ledger_report.get("ok").and_then(|value| value.as_bool()).unwrap_or(false),
         "ledger": ledger_report,
@@ -1085,6 +1130,27 @@ pub async fn money_overview(
         "todayUsageUsd": admin_sum_since(&state, "SELECT COALESCE(SUM(CAST(le.amount AS REAL)), 0) AS amount FROM ledger_entries le JOIN wallet_accounts fa ON fa.id = le.from_account_id JOIN wallet_accounts ta ON ta.id = le.to_account_id WHERE le.reference_type = 'request_charge' AND fa.account_type IN ('user_reserved','user_cash') AND ta.account_type IN ('client_payable','fee_revenue') AND le.created_at >= ?1", &today).await?,
         "todayTopupsUsd": admin_sum_since(&state, "SELECT COALESCE(SUM(CAST(gross_amount AS REAL)), 0) AS amount FROM topup_orders WHERE status = 'paid' AND paid_at >= ?1", &today).await?,
     })))
+}
+
+pub async fn summary(
+    State(state): State<AppState>,
+    _admin: AdminPrincipal,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let value = cached_json(&ADMIN_SUMMARY_CACHE, Duration::from_secs(10), || async {
+        let today = admin_today_start_utc(&state).await?;
+        let ledger_report = cached_ledger_report(&state).await?;
+        Ok(serde_json::json!({
+            "ledgerOk": ledger_report.get("ok").and_then(|value| value.as_bool()).unwrap_or(false),
+            "openTickets": admin_count(&state, "SELECT COUNT(*) AS count FROM tickets WHERE status IN ('open','waiting_admin')").await?,
+            "pendingTopups": admin_count(&state, "SELECT COUNT(*) AS count FROM topup_orders WHERE status='pending'").await?,
+            "needsReviewCharges": admin_count(&state, "SELECT COUNT(*) AS count FROM request_charges WHERE status='needs_review'").await?,
+            "pendingPayouts": admin_count(&state, "SELECT COUNT(*) AS count FROM payout_requests WHERE status IN ('pending','processing','needs_review')").await?,
+            "todayUsageUsd": admin_sum_since(&state, "SELECT COALESCE(SUM(CAST(le.amount AS REAL)), 0) AS amount FROM ledger_entries le JOIN wallet_accounts fa ON fa.id = le.from_account_id JOIN wallet_accounts ta ON ta.id = le.to_account_id WHERE le.reference_type = 'request_charge' AND fa.account_type IN ('user_reserved','user_cash') AND ta.account_type IN ('client_payable','fee_revenue') AND le.created_at >= ?1", &today).await?,
+            "todayTopupsUsd": admin_sum_since(&state, "SELECT COALESCE(SUM(CAST(gross_amount AS REAL)), 0) AS amount FROM topup_orders WHERE status = 'paid' AND paid_at >= ?1", &today).await?,
+        }))
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 async fn admin_count(state: &AppState, sql: &str) -> Result<i64, ApiError> {
@@ -1137,7 +1203,7 @@ pub async fn ledger_check(
     State(state): State<AppState>,
     _admin: AdminPrincipal,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    Ok(Json(ledger::consistency_report(state.db()).await?))
+    Ok(Json(cached_ledger_report(&state).await?))
 }
 
 pub async fn settlements(

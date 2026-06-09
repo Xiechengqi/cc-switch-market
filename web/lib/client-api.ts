@@ -18,6 +18,17 @@ export async function apiGetItems<T>(path: string, admin = false): Promise<T[]> 
   return value.items ?? [];
 }
 
+export async function apiGetPage<T>(path: string, options: { limit?: number; cursor?: string | null } = {}, admin = false): Promise<Page<T>> {
+  const separator = path.includes("?") ? "&" : "?";
+  const params = new URLSearchParams();
+  if (options.limit) params.set("limit", String(options.limit));
+  if (options.cursor) params.set("cursor", options.cursor);
+  const suffix = params.toString();
+  const value = await apiGet<T[] | Page<T>>(suffix ? `${path}${separator}${suffix}` : path, admin);
+  if (Array.isArray(value)) return { items: value, hasMore: false, nextCursor: null };
+  return value;
+}
+
 export async function apiGetAllItems<T>(path: string, admin = false): Promise<T[]> {
   const items: T[] = [];
   let cursor: string | null | undefined;

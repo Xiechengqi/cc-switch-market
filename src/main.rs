@@ -419,6 +419,7 @@ fn build_router(state: AppState) -> Router {
             post(support::add_ticket_message),
         )
         .route("/v1/admin/users", get(admin::users))
+        .route("/v1/admin/summary", get(admin::summary))
         .route("/v1/admin/users/{id}", get(admin::user))
         .route("/v1/admin/users/{id}/ledger", get(admin::user_ledger))
         .route("/v1/admin/users/{id}/adjust", post(admin::adjust_user))
@@ -528,17 +529,18 @@ async fn metrics_middleware(
     let endpoint = metrics_endpoint(request.uri().path());
     let started = std::time::Instant::now();
     let response = next.run(request).await;
-    state.metrics.record(
-        &endpoint,
-        response.status(),
-        started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-    );
+    let status = response.status();
+    let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    state.metrics.record(&endpoint, status, latency_ms);
+    if latency_ms >= 500 {
+        tracing::warn!(endpoint = %endpoint, status = %status, latency_ms, "slow market request");
+    }
     response
 }
 
 fn metrics_endpoint(path: &str) -> String {
     if path.starts_with("/v1/admin/") {
-        "/v1/admin/*".to_string()
+        admin_metrics_endpoint(path)
     } else if path.starts_with("/v1/provider/") {
         "/v1/provider/*".to_string()
     } else if path.starts_with("/v1/auth/") || path.starts_with("/market-api/auth/") {
@@ -551,5 +553,25 @@ fn metrics_endpoint(path: &str) -> String {
         "/_next/*".to_string()
     } else {
         path.to_string()
+    }
+}
+
+fn admin_metrics_endpoint(path: &str) -> String {
+    let mut parts = path.trim_start_matches('/').split('/');
+    let _v1 = parts.next();
+    let _admin = parts.next();
+    let Some(resource) = parts.next() else {
+        return "/v1/admin/*".to_string();
+    };
+    match resource {
+        "users" | "topups" | "shares" | "charges" | "earnings" | "ledger" | "money-events"
+        | "settlements" | "payout-requests" | "tickets" | "audit" | "summary" => {
+            format!("/v1/admin/{resource}/*")
+        }
+        "money" => "/v1/admin/money/*".to_string(),
+        "settings" => "/v1/admin/settings/*".to_string(),
+        "models" => "/v1/admin/models/*".to_string(),
+        "version" => "/v1/admin/version/*".to_string(),
+        _ => "/v1/admin/*".to_string(),
     }
 }

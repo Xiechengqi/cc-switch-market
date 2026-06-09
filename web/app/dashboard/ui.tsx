@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { useForm } from "react-hook-form";
 import {
   Wallet,
@@ -25,7 +25,7 @@ import { EmptyState } from "@/components/ui/EmptyState";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/shadcn/form";
-import { apiDelete, apiGet, apiGetAllItems, apiPost } from "@/lib/client-api";
+import { apiDelete, apiGet, apiGetPage, apiPost } from "@/lib/client-api";
 import { useLocale } from "@/components/language-provider";
 import { copy } from "@/lib/copy";
 import { useDateTimeFormatter } from "@/lib/time";
@@ -196,6 +196,69 @@ function ConsoleDataTable<T>(props: DataTableProps<T>) {
   );
 }
 
+type PagedRows<T> = {
+  items: T[] | null;
+  hasMore: boolean;
+  loadingMore: boolean;
+  reload: () => void;
+  loadMore: () => void;
+};
+
+function usePagedRows<T>(path: string, limit = 50): PagedRows<T> {
+  const [items, setItems] = useState<T[] | null>(null);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+
+  const loadPage = useCallback(async (cursor: string | null, append: boolean) => {
+    if (append) setLoadingMore(true);
+    else setItems(null);
+    try {
+      const page = await apiGetPage<T>(path, { limit, cursor });
+      setItems((prev) => append ? [...(prev ?? []), ...(page.items ?? [])] : (page.items ?? []));
+      setNextCursor(page.nextCursor ?? null);
+      setHasMore(Boolean(page.hasMore));
+    } catch {
+      if (!append) setItems([]);
+      setNextCursor(null);
+      setHasMore(false);
+    } finally {
+      if (append) setLoadingMore(false);
+    }
+  }, [limit, path]);
+
+  const reload = useCallback(() => { void loadPage(null, false); }, [loadPage]);
+  const loadMore = useCallback(() => {
+    if (!hasMore || loadingMore) return;
+    void loadPage(nextCursor, true);
+  }, [hasMore, loadPage, loadingMore, nextCursor]);
+
+  useEffect(() => { reload(); }, [reload]);
+
+  return { items, hasMore, loadingMore, reload, loadMore };
+}
+
+function PagedConsoleDataTable<T>({ page, ...props }: Omit<DataTableProps<T>, "rows" | "loading"> & { page: PagedRows<T> }) {
+  const { locale } = useLocale();
+  return (
+    <div className="grid gap-3">
+      <ConsoleDataTable {...props} rows={page.items ?? []} loading={page.items === null} />
+      {page.hasMore && (
+        <div className="flex justify-center">
+          <button
+            type="button"
+            onClick={page.loadMore}
+            disabled={page.loadingMore}
+            className="rounded-full border-2 border-slate-800 bg-white px-5 py-2 text-sm font-bold lift disabled:opacity-50"
+          >
+            {page.loadingMore ? (locale === "zh" ? "加载中..." : "Loading...") : (locale === "zh" ? "加载更多" : "Load more")}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function DashboardRoot() {
   const { user } = useMarketAuth();
   const toast = useToast();
@@ -252,7 +315,7 @@ function Overview() {
   useEffect(() => {
     apiGet<WalletSummary>("/v1/wallet/summary").then(setWallet).catch(() => setWallet({ user_cash_usd: "0", user_reserved_usd: "0" }));
     apiGet<ApiKeyItem[]>("/v1/api-keys").then(setKeys).catch(() => setKeys([]));
-    apiGetAllItems<MoneyEvent>("/v1/money-events").then(setEvents).catch(() => setEvents([]));
+    apiGetPage<MoneyEvent>("/v1/money-events", { limit: 6 }).then((page) => setEvents(page.items ?? [])).catch(() => setEvents([]));
   }, []);
 
   const activeKeys = (keys ?? []).filter((k) => !k.revoked_at && !k.paused_at && !k.deleted_at).length;
@@ -308,19 +371,19 @@ function WalletTab() {
   const publicConfig = usePublicConfig();
   const [summary, setSummary] = useState<WalletSummary | null>(null);
   const [claimSummary, setClaimSummary] = useState<ClaimSummary | null>(null);
-  const [items, setItems] = useState<MoneyEvent[] | null>(null);
+  const ledgerPage = usePagedRows<MoneyEvent>("/v1/wallet/ledger");
   const [topupOpen, setTopupOpen] = useState(false);
   const [transferOpen, setTransferOpen] = useState(false);
   const formatDate = useDateTimeFormatter();
   const claimAvailable = claimSummary?.available_usd ?? "0";
   const canTransferClaim = Number(claimAvailable) > 0;
 
-  function reload() {
+  function reload(refreshLedger = true) {
     apiGet<WalletSummary>("/v1/wallet/summary").then(setSummary).catch(() => setSummary({ user_cash_usd: "0", user_reserved_usd: "0" }));
     apiGet<ClaimSummary>("/v1/provider/claim/summary").then(setClaimSummary).catch(() => setClaimSummary({ available_usd: "0" }));
-    apiGetAllItems<MoneyEvent>("/v1/wallet/ledger").then(setItems).catch(() => setItems([]));
+    if (refreshLedger) ledgerPage.reload();
   }
-  useEffect(() => { reload(); }, []);
+  useEffect(() => { reload(false); }, []);
   useEffect(() => {
     if (typeof window === "undefined") return;
     const params = new URLSearchParams(window.location.search);
@@ -378,9 +441,8 @@ function WalletTab() {
           </div>
         </div>
       </div>
-      <ConsoleDataTable
-        rows={items ?? []}
-        loading={items === null}
+      <PagedConsoleDataTable
+        page={ledgerPage}
         rowKey={(row, idx) => String(row.id ?? idx)}
         empty={<EmptyState shape="circle" title={c.wallet.emptyTitle} hint={c.wallet.emptyHint} />}
         columns={[
@@ -1243,14 +1305,10 @@ function UsageTab() {
   const { locale } = useLocale();
   const c = copy[locale].dashboard.usage;
   const toast = useToast();
-  const [items, setItems] = useState<UsageItem[] | null>(null);
+  const page = usePagedRows<UsageItem>("/v1/usage");
   const [reportingId, setReportingId] = useState<string | null>(null);
   const [reportTarget, setReportTarget] = useState<UsageItem | null>(null);
   const formatDate = useDateTimeFormatter();
-
-  useEffect(() => {
-    apiGetAllItems<UsageItem>("/v1/usage").then(setItems).catch(() => setItems([]));
-  }, []);
 
   async function reportUsage(row: UsageItem) {
     if (!row.id || row.status !== "settled") return;
@@ -1268,9 +1326,8 @@ function UsageTab() {
 
   return (
     <div className="grid gap-4">
-      <ConsoleDataTable
-        rows={items ?? []}
-        loading={items === null}
+      <PagedConsoleDataTable
+        page={page}
         rowKey={(row, i) => String(row.id ?? row.request_id ?? i)}
         empty={<EmptyState shape="triangle" title={c.emptyTitle} hint={c.emptyHint} />}
         rowClassName={(r) => r.status === "needs_review" ? "bg-pink-50" : ""}

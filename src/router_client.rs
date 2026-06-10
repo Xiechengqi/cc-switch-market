@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use tokio::time::{Duration, sleep};
 
-use crate::{app_state::AppState, error::ApiError};
+use crate::{app_state::AppState, error::ApiError, failure::FailureKind};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -230,6 +230,24 @@ pub async fn report_quota_exhausted(
     });
 }
 
+pub async fn report_failure(
+    state: &AppState,
+    router_id: &str,
+    share_id: &str,
+    kind: FailureKind,
+    ttl_secs: Option<u64>,
+) {
+    match kind {
+        FailureKind::Upstream429 => {
+            report_rate_limited(state, router_id, share_id).await;
+        }
+        FailureKind::QuotaExhausted => {
+            report_quota_exhausted(state, router_id, share_id, ttl_secs.unwrap_or(15 * 60)).await;
+        }
+        _ => {}
+    }
+}
+
 async fn report_feedback_inner(
     state: &AppState,
     share_id: &str,
@@ -407,7 +425,7 @@ async fn release_share_state(
             let changed = state
                 .db()
                 .execute(
-                    "UPDATE router_shares SET last_error_at=NULL, last_error_message=NULL, failure_count=0, cooldown_until=NULL WHERE router_id=?1 AND share_id=?2",
+                    "UPDATE router_shares SET last_error_at=NULL, last_error_message=NULL, last_failure_kind=NULL, last_failure_scope=NULL, failure_count=0, cooldown_until=NULL WHERE router_id=?1 AND share_id=?2",
                     vec![crate::db::val(router_id), crate::db::val(share_id)],
                 )
                 .await?;
@@ -597,7 +615,7 @@ pub async fn sync_share_runtime_state_snapshot(state: &AppState) -> Result<usize
     for row in db
         .query_all(
             r#"
-            SELECT router_id, share_id, cooldown_until, failure_count, last_error_message
+            SELECT router_id, share_id, cooldown_until, failure_count, last_error_message, last_failure_kind, last_failure_scope
               FROM router_shares
              WHERE cooldown_until IS NOT NULL AND cooldown_until > ?1
             "#,
@@ -608,12 +626,18 @@ pub async fn sync_share_runtime_state_snapshot(state: &AppState) -> Result<usize
         states.push(MarketShareRuntimeState {
             share_id: row.string("share_id"),
             router_id: Some(row.string("router_id")),
-            scope: "share".to_string(),
+            scope: row
+                .opt_string("last_failure_scope")
+                .unwrap_or_else(|| "share".to_string()),
             kind: "cooldown".to_string(),
             app_type: None,
             model_id: None,
             model_name: None,
-            reason_kind: Some("share_cooldown".to_string()),
+            reason_kind: Some(
+                row.opt_string("last_failure_kind")
+                    .map(|kind| FailureKind::from_code(&kind).code().to_string())
+                    .unwrap_or_else(|| "share_cooldown".to_string()),
+            ),
             reason: row.opt_string("last_error_message"),
             failure_count: Some(row.i64("failure_count")),
             expires_at: row.opt_string("cooldown_until"),

@@ -959,6 +959,7 @@ function SharesTab() {
           { key: "blocked", header: "Market 黑名单", render: (r) => <ShareCapabilityBadges row={r} mode="blocked" /> },
           { key: "online", header: "在线", render: (r) => <Pill variant={r.online ? "success" : "neutral"}>{r.online ? "在线" : "离线"}</Pill> },
           { key: "load", header: "并发", render: (r) => <span className="font-mono text-sm">{String(r.active_requests ?? 0)} / {String(r.parallel_limit ?? 0)}</span> },
+          { key: "failure", header: "最近失败", render: (r) => <ShareFailureCell row={r} /> },
           { key: "seen", header: "最近同步", render: (r) => <span className="text-xs text-slate-500">{formatDate(String(r.last_seen_at ?? ""))}</span> },
           { key: "actions", header: "操作", render: (r) => <ShareCapabilityActions row={r} updatingKey={updatingKey} onToggle={setCapabilityBlocked} /> }
         ]}
@@ -1012,6 +1013,22 @@ function parseRawJson(value: unknown): AnyRow | null {
   } catch {
     return null;
   }
+}
+
+function ShareFailureCell({ row }: { row: AnyRow }) {
+  const kind = String(row.last_failure_kind ?? "");
+  const scope = String(row.last_failure_scope ?? "");
+  const message = String(row.last_error_message ?? "");
+  if (!kind && !message) return <span className="text-xs text-slate-400">—</span>;
+  return (
+    <div className="max-w-64 text-xs">
+      <div className="flex flex-wrap gap-1">
+        {kind && <span className="rounded-full border border-slate-800 bg-pink-100 px-2 py-0.5 font-bold text-pink-700">{kind}</span>}
+        {scope && <span className="rounded-full border border-slate-800 bg-amber-100 px-2 py-0.5 font-bold text-slate-700">{scope}</span>}
+      </div>
+      {message && <div className="mt-1 line-clamp-2 break-words text-slate-500">{message}</div>}
+    </div>
+  );
 }
 
 function ShareCapabilityActions({ row, updatingKey, onToggle }: { row: AnyRow; updatingKey: string | null; onToggle: (row: AnyRow, capability: string, blocked: boolean) => void }) {

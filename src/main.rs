@@ -7,6 +7,7 @@ mod config_wizard;
 mod dashboard;
 mod db;
 mod error;
+mod failure;
 mod gateio;
 mod ledger;
 mod maintenance;

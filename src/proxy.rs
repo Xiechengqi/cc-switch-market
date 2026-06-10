@@ -17,6 +17,7 @@ use crate::{
     app_state::AppState,
     auth::ApiKeyPrincipal,
     error::ApiError,
+    failure::FailureKind,
     ledger::{self, AccountRef},
     pricing,
     usage::{SseUsageParser, UsageProtocol},
@@ -395,13 +396,14 @@ async fn handle_llm_request_with_model(
         Ok(value) => value,
         Err(err) => {
             let error_message = err.to_string();
+            let audit_flags = upstream_failure_audit_flags("upstream_failed", &error_message);
             if let Err(release_err) = release_reserved_request(
                 &state,
                 api.user_id,
                 charge_id,
                 idempotency_key.as_deref(),
                 reserved_amount,
-                serde_json::json!([{"code":"upstream_failed","message": error_message}]),
+                audit_flags,
             )
             .await
             {
@@ -534,13 +536,15 @@ async fn handle_openai_stream(
         Ok(value) => value,
         Err(err) => {
             let error_message = err.to_string();
+            let audit_flags =
+                upstream_failure_audit_flags("upstream_failed_before_stream", &error_message);
             if let Err(release_err) = release_reserved_request(
                 &state,
                 api.user_id,
                 charge_id,
                 idempotency_key.as_deref(),
                 reserved_amount,
-                serde_json::json!([{"code":"upstream_failed_before_stream","message": error_message}]),
+                audit_flags,
             )
             .await
             {
@@ -1205,6 +1209,18 @@ async fn mark_stream_needs_review(
     mut audit_flags: serde_json::Value,
 ) -> Result<(), ApiError> {
     append_audit_flag(&mut audit_flags, reason);
+    let failure_kind = match reason {
+        "stream_client_disconnected" => FailureKind::ClientDisconnected,
+        "stream_upstream_interrupted" => FailureKind::StreamInterrupted,
+        "stream_usage_missing" | "non_stream_usage_missing" => FailureKind::StreamUsageMissing,
+        "stream_settlement_failed" => FailureKind::SettlementFailed,
+        _ => FailureKind::Unknown,
+    };
+    crate::failure::append_failure_audit_flags(
+        &mut audit_flags,
+        failure_kind,
+        failure_kind.policy(),
+    );
     let tx = state.db().begin_immediate().await?;
     tx.execute(
         r#"
@@ -1249,6 +1265,13 @@ fn append_audit_flag(flags: &mut serde_json::Value, flag: &str) {
     } else {
         *flags = serde_json::json!([flag]);
     }
+}
+
+fn upstream_failure_audit_flags(code: &str, message: &str) -> serde_json::Value {
+    let kind = classify_upstream_failure(message);
+    let mut flags = serde_json::json!([{"code": code, "message": message}]);
+    crate::failure::append_failure_audit_flags(&mut flags, kind, kind.policy());
+    flags
 }
 
 async fn transfer_collected_usage_amount(
@@ -1459,12 +1482,12 @@ async fn forward_to_router_market_proxy(
             .unwrap_or_else(|_| json!({ "raw": text }));
         let error_message = format!("router market proxy returned {status}: {value}");
         let kind = classify_upstream_failure(&error_message);
-        if kind != "bad_request" {
-            record_share_health(state, share, "error", None, Some(error_message.clone())).await;
+        if kind != FailureKind::BadRequest {
+            record_share_failure(state, share, kind, Some(error_message.clone())).await;
         }
         return Err(router_market_proxy_error(status, error_message));
     }
-    record_share_health(state, share, "success", None, None).await;
+    record_share_success(state, share).await;
     if is_event_stream || looks_like_sse(&text) {
         return Ok(UpstreamNonStreamResponse::SseText(text));
     }
@@ -1517,12 +1540,12 @@ async fn forward_to_router_market_proxy_stream(
         let text = response.text().await.unwrap_or_default();
         let error_message = format!("router market proxy returned {status}: {text}");
         let kind = classify_upstream_failure(&error_message);
-        if kind != "bad_request" {
-            record_share_health(state, share, "error", None, Some(error_message.clone())).await;
+        if kind != FailureKind::BadRequest {
+            record_share_failure(state, share, kind, Some(error_message.clone())).await;
         }
         return Err(router_market_proxy_error(status, error_message));
     }
-    record_share_health(state, share, "success", None, None).await;
+    record_share_success(state, share).await;
     Ok(response)
 }
 
@@ -1571,7 +1594,7 @@ async fn forward_non_stream_with_retries(
                     share,
                     idx + 1,
                     "error",
-                    Some(kind),
+                    Some(kind.code()),
                     Some(message.clone()),
                     started,
                 )
@@ -2198,7 +2221,7 @@ async fn forward_stream_with_retries(
                     share,
                     idx + 1,
                     "error",
-                    Some(kind),
+                    Some(kind.code()),
                     Some(message.clone()),
                     started,
                 )
@@ -2236,7 +2259,7 @@ async fn update_charge_route(
     Ok(())
 }
 
-async fn record_share_health(
+async fn record_share_health_sample(
     state: &AppState,
     share: &SelectedShare,
     status: &str,
@@ -2259,11 +2282,52 @@ async fn record_share_health(
             ],
         )
         .await;
-    if status == "success" {
-        let _ = state.db().execute(
-            "UPDATE router_shares SET last_success_at=?3, last_error_at=NULL, last_error_message=NULL, failure_count=0, cooldown_until=NULL WHERE router_id=?1 AND share_id=?2",
-            vec![crate::db::val(&share.router_id), crate::db::val(&share.share_id), crate::db::val(&now)],
-        ).await;
+}
+
+async fn record_share_success(state: &AppState, share: &SelectedShare) {
+    let now = crate::db::now_string();
+    record_share_health_sample(state, share, "success", None, None).await;
+    let _ = state
+        .db()
+        .execute(
+            "UPDATE router_shares SET last_success_at=?3 WHERE router_id=?1 AND share_id=?2",
+            vec![
+                crate::db::val(&share.router_id),
+                crate::db::val(&share.share_id),
+                crate::db::val(&now),
+            ],
+        )
+        .await;
+    let changed = state
+        .db()
+        .execute(
+            r#"
+            UPDATE router_shares
+               SET last_error_at=NULL,
+                   last_error_message=NULL,
+                   last_failure_kind=NULL,
+                   last_failure_scope=NULL,
+                   failure_count=0,
+                   cooldown_until=NULL
+             WHERE router_id=?1 AND share_id=?2
+               AND (last_failure_scope IS NULL OR last_failure_scope IN ('share','market_path'))
+               AND (
+                   last_error_at IS NOT NULL
+                   OR last_error_message IS NOT NULL
+                   OR last_failure_kind IS NOT NULL
+                   OR last_failure_scope IS NOT NULL
+                   OR failure_count != 0
+                   OR cooldown_until IS NOT NULL
+               )
+            "#,
+            vec![
+                crate::db::val(&share.router_id),
+                crate::db::val(&share.share_id),
+            ],
+        )
+        .await
+        .unwrap_or(0);
+    if changed > 0 {
         crate::router_client::report_share_runtime_state(
             state,
             crate::router_client::MarketShareRuntimeState {
@@ -2280,52 +2344,90 @@ async fn record_share_health(
                 expires_at: Some(now),
             },
         );
-    } else {
-        let current_failures = state
-            .db()
-            .query_optional(
-                "SELECT failure_count FROM router_shares WHERE router_id=?1 AND share_id=?2",
-                vec![
-                    crate::db::val(&share.router_id),
-                    crate::db::val(&share.share_id),
-                ],
-            )
-            .await
-            .ok()
-            .flatten()
-            .map(|row| row.i64("failure_count"))
-            .unwrap_or(0);
-        let failure_count = current_failures.saturating_add(1);
-        let cooldown_secs = match failure_count {
-            0 | 1 => 30,
-            2 => 120,
-            3 => 300,
-            _ => 900,
-        };
-        let cooldown_until =
-            (chrono::Utc::now() + chrono::Duration::seconds(cooldown_secs)).to_rfc3339();
-        let reason = error_message.clone();
-        let _ = state.db().execute(
-            "UPDATE router_shares SET last_error_at=?3, last_error_message=?4, failure_count=?5, cooldown_until=?6 WHERE router_id=?1 AND share_id=?2",
-            vec![crate::db::val(&share.router_id), crate::db::val(&share.share_id), crate::db::val(now), crate::db::opt_val(error_message), crate::db::val(failure_count), crate::db::val(&cooldown_until)],
-        ).await;
-        crate::router_client::report_share_runtime_state(
-            state,
-            crate::router_client::MarketShareRuntimeState {
-                share_id: share.share_id.clone(),
-                router_id: Some(share.router_id.clone()),
-                scope: "share".to_string(),
-                kind: "cooldown".to_string(),
-                app_type: None,
-                model_id: None,
-                model_name: None,
-                reason_kind: Some("share_cooldown".to_string()),
-                reason,
-                failure_count: Some(failure_count),
-                expires_at: Some(cooldown_until),
-            },
-        );
     }
+}
+
+async fn record_share_failure(
+    state: &AppState,
+    share: &SelectedShare,
+    kind: FailureKind,
+    error_message: Option<String>,
+) {
+    let now = crate::db::now_string();
+    record_share_health_sample(state, share, "error", None, error_message.clone()).await;
+    let policy = kind.policy();
+    let current_failures = state
+        .db()
+        .query_optional(
+            "SELECT failure_count FROM router_shares WHERE router_id=?1 AND share_id=?2",
+            vec![
+                crate::db::val(&share.router_id),
+                crate::db::val(&share.share_id),
+            ],
+        )
+        .await
+        .ok()
+        .flatten()
+        .map(|row| row.i64("failure_count"))
+        .unwrap_or(0);
+    let failure_count = if policy.counts_against_share {
+        current_failures.saturating_add(1)
+    } else {
+        current_failures
+    };
+    let cooldown_secs = if policy.counts_against_share {
+        crate::failure::cooldown_secs(kind, failure_count)
+    } else {
+        0
+    };
+    let cooldown_until = (cooldown_secs > 0)
+        .then(|| (chrono::Utc::now() + chrono::Duration::seconds(cooldown_secs)).to_rfc3339());
+    let reason = error_message.clone();
+    let _ = state
+        .db()
+        .execute(
+            r#"
+            UPDATE router_shares
+               SET last_error_at=?3,
+                   last_error_message=?4,
+                   last_failure_kind=?5,
+                   last_failure_scope=?6,
+                   failure_count=?7,
+                   cooldown_until=?8
+             WHERE router_id=?1 AND share_id=?2
+            "#,
+            vec![
+                crate::db::val(&share.router_id),
+                crate::db::val(&share.share_id),
+                crate::db::val(now),
+                crate::db::opt_val(error_message),
+                crate::db::val(kind.code()),
+                crate::db::val(policy.scope.code()),
+                crate::db::val(failure_count),
+                crate::db::opt_val(cooldown_until.clone()),
+            ],
+        )
+        .await;
+    crate::router_client::report_share_runtime_state(
+        state,
+        crate::router_client::MarketShareRuntimeState {
+            share_id: share.share_id.clone(),
+            router_id: Some(share.router_id.clone()),
+            scope: policy.scope.code().to_string(),
+            kind: if cooldown_until.is_some() {
+                "cooldown".to_string()
+            } else {
+                "failure".to_string()
+            },
+            app_type: Some(share.app_type.clone()),
+            model_id: share.price.model_id.map(|id| id.to_string()),
+            model_name: Some(share.pricing_model.clone()),
+            reason_kind: Some(kind.code().to_string()),
+            reason,
+            failure_count: Some(failure_count),
+            expires_at: cooldown_until,
+        },
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2367,28 +2469,30 @@ async fn record_request_attempt(
     ).await;
 }
 
-fn classify_upstream_failure(message: &str) -> &'static str {
+fn classify_upstream_failure(message: &str) -> FailureKind {
     let lower = message.to_ascii_lowercase();
     if lower.contains("timed out") || lower.contains("timeout") {
-        "timeout"
+        FailureKind::ConnectTimeout
+    } else if lower.contains("connection refused") || lower.contains("connect refused") {
+        FailureKind::ConnectRefused
     } else if is_quota_exhausted_message(&lower) {
-        "quota_exhausted"
+        FailureKind::QuotaExhausted
     } else if lower.contains("429") {
-        "rate_limited"
+        FailureKind::Upstream429
     } else if lower.contains("502") || lower.contains("503") || lower.contains("504") {
-        "upstream_unavailable"
+        FailureKind::Upstream5xx
     } else if lower.contains("401") || lower.contains("403") {
-        "auth_failed"
+        FailureKind::AuthInvalid
     } else if is_parameter_level_bad_request(&lower) {
-        "bad_request"
+        FailureKind::BadRequest
     } else if is_model_unsupported_message(&lower) {
-        "model_unsupported"
+        FailureKind::ModelUnsupported
     } else if lower.contains("400") || lower.contains("bad request") {
-        "bad_request"
+        FailureKind::BadRequest
     } else if lower.contains("router market proxy failed") {
-        "network"
+        FailureKind::TunnelUnavailable
     } else {
-        "upstream_error"
+        FailureKind::BadGatewayResponse
     }
 }
 
@@ -2442,39 +2546,25 @@ fn is_quota_exhausted_message(lower: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-fn is_retryable_failure(kind: &str) -> bool {
-    matches!(
-        kind,
-        "timeout" | "rate_limited" | "quota_exhausted" | "upstream_unavailable" | "network"
-    )
+fn is_retryable_failure(kind: FailureKind) -> bool {
+    kind.policy().retryable_hint
 }
 
-/// Forward a `rate_limited` classification to the router so it down-ranks
-/// every share of the same owner. No-op for other failure kinds; the router
-/// handles auth/model errors on its own (cooldown via `failure_count`) and we
-/// don't want a one-off network blip to penalize an entire owner.
 async fn maybe_report_router_feedback(
     state: &AppState,
     share: &SelectedShare,
-    kind: &str,
+    kind: FailureKind,
     message: &str,
 ) {
-    match kind {
-        "rate_limited" => {
-            crate::router_client::report_rate_limited(state, &share.router_id, &share.share_id)
-                .await;
-        }
-        "quota_exhausted" => {
-            crate::router_client::report_quota_exhausted(
-                state,
-                &share.router_id,
-                &share.share_id,
-                quota_exhausted_ttl_secs(message),
-            )
-            .await;
-        }
-        _ => {}
+    if !kind.policy().report_to_router {
+        return;
     }
+    if !matches!(kind, FailureKind::Upstream429 | FailureKind::QuotaExhausted) {
+        return;
+    }
+    let ttl_secs = (kind == FailureKind::QuotaExhausted).then(|| quota_exhausted_ttl_secs(message));
+    crate::router_client::report_failure(state, &share.router_id, &share.share_id, kind, ttl_secs)
+        .await;
 }
 
 fn quota_exhausted_ttl_secs(message: &str) -> u64 {
@@ -2492,10 +2582,10 @@ async fn maybe_block_model_share(
     state: &AppState,
     model_id: Uuid,
     share: &SelectedShare,
-    kind: &str,
+    kind: FailureKind,
     message: &str,
 ) {
-    if kind != "model_unsupported" {
+    if kind != FailureKind::ModelUnsupported {
         return;
     }
     let now = chrono::Utc::now();
@@ -2527,7 +2617,7 @@ async fn maybe_block_model_share(
                 app_type: Some(share.price.app_type.clone()),
                 model_id: Some(model_id.to_string()),
                 model_name: Some(share.pricing_model.clone()),
-                reason_kind: Some(kind.to_string()),
+                reason_kind: Some(kind.code().to_string()),
                 reason: Some(message.chars().take(500).collect::<String>()),
                 failure_count: None,
                 expires_at: Some(expires_at.to_rfc3339()),
@@ -3463,7 +3553,7 @@ mod tests {
         parse_gemini_model_action, parse_non_stream_sse_fallback, quota_exhausted_ttl_secs,
         rendezvous_share_score, share_subdomain, share_weight,
     };
-    use crate::{auth::ApiKeyPrincipal, pricing, usage::UsageProtocol};
+    use crate::{auth::ApiKeyPrincipal, failure::FailureKind, pricing, usage::UsageProtocol};
     use rust_decimal::Decimal;
     use serde_json::json;
     use uuid::Uuid;
@@ -3520,18 +3610,18 @@ mod tests {
     #[test]
     fn upstream_unsupported_parameter_is_bad_request_not_model_unsupported() {
         let message = r#"router market proxy returned 400 Bad Request: {"error":{"code":"cc_switch_upstream_error","message":"OpenAI upstream returned 400 for {\"model\":\"gpt-5.5\"}: Unsupported parameter: frequency_penalty","upstream_status":400}}"#;
-        assert_eq!(classify_upstream_failure(message), "bad_request");
+        assert_eq!(classify_upstream_failure(message), FailureKind::BadRequest);
     }
 
     #[test]
     fn upstream_model_unsupported_uses_phrase_match() {
         assert_eq!(
             classify_upstream_failure("OpenAI upstream returned 400: model is not supported"),
-            "model_unsupported"
+            FailureKind::ModelUnsupported
         );
         assert_eq!(
             classify_upstream_failure("OpenAI upstream returned 404: unsupported model gpt-old"),
-            "model_unsupported"
+            FailureKind::ModelUnsupported
         );
     }
 
@@ -3541,7 +3631,7 @@ mod tests {
             classify_upstream_failure(
                 "router market proxy returned 400 Bad Request: invalid request body"
             ),
-            "bad_request"
+            FailureKind::BadRequest
         );
     }
 
@@ -3549,9 +3639,9 @@ mod tests {
     fn upstream_quota_exhausted_is_retryable_long_feedback() {
         assert_eq!(
             classify_upstream_failure("OpenAI upstream returned 429: weekly limit exceeded"),
-            "quota_exhausted"
+            FailureKind::QuotaExhausted
         );
-        assert!(is_retryable_failure("quota_exhausted"));
+        assert!(is_retryable_failure(FailureKind::QuotaExhausted));
         assert_eq!(
             quota_exhausted_ttl_secs("monthly quota exhausted"),
             31 * 24 * 60 * 60

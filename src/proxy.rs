@@ -2871,6 +2871,7 @@ async fn select_share_candidates(
                 AND mscb.share_id = router_shares.share_id
                 AND mscb.capability = ?12
            )
+           AND COALESCE(json_extract(raw_json, '$.appAvailability.' || ?12 || '.status'), '') != 'unavailable'
            AND (
              ?3 IS NULL
              OR ?4 = 0
@@ -2935,6 +2936,16 @@ async fn select_share_candidates(
     for row in rows {
         let router_id = row.string("router_id");
         let share_id = row.string("share_id");
+        let raw_json = row.opt_string("raw_json");
+        if raw_share_app_quota_blocked(raw_json.as_deref(), capability) {
+            tracing::debug!(
+                %router_id,
+                %share_id,
+                capability,
+                "skip router share blocked by router app quota state"
+            );
+            continue;
+        }
         let Some((pricing_model, pricing_slot, pricing_model_source, share_official, price)) =
             resolve_share_pricing(
                 db,
@@ -2949,8 +2960,7 @@ async fn select_share_candidates(
         else {
             continue;
         };
-        let share_sale_percent =
-            share_sale_percent_from_raw(&row.opt_string("raw_json"), capability);
+        let share_sale_percent = share_sale_percent_from_raw(&raw_json, capability);
         if let Some(share_sale_percent) = share_sale_percent {
             if price.discount_percent < rust_decimal::Decimal::from(share_sale_percent) {
                 continue;
@@ -3037,6 +3047,96 @@ fn share_sale_percent_from_raw(raw_json: &Option<String>, capability: &str) -> O
         .as_u64()
         .and_then(|value| u16::try_from(value).ok())
         .filter(|value| (1..=100).contains(value))
+}
+
+fn raw_share_app_quota_blocked(raw_json: Option<&str>, capability: &str) -> bool {
+    let Some(raw) = raw_json else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    if value
+        .get("appAvailability")
+        .and_then(|availability| availability.get(capability))
+        .and_then(|entry| entry.get("status"))
+        .and_then(|status| status.as_str())
+        .is_some_and(|status| status.eq_ignore_ascii_case("unavailable"))
+    {
+        return true;
+    }
+    if value
+        .get("appRuntimes")
+        .and_then(|runtimes| runtimes.get(capability))
+        .and_then(|runtime| runtime.get("quota"))
+        .is_some_and(raw_quota_block_is_active)
+    {
+        return true;
+    }
+    value
+        .get("modelHealth")
+        .and_then(|health| health.get(capability))
+        .and_then(|entries| entries.as_array())
+        .is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| raw_model_health_entry_is_quota_blocked(entry, capability))
+        })
+}
+
+fn raw_quota_block_is_active(quota: &serde_json::Value) -> bool {
+    let availability = quota
+        .get("availability")
+        .and_then(|value| value.as_str())
+        .unwrap_or("available");
+    if !matches!(
+        availability,
+        "short_window_exhausted" | "long_window_exhausted"
+    ) {
+        return false;
+    }
+    let Some(blocked_until) = quota.get("blockedUntil").and_then(|value| value.as_str()) else {
+        return true;
+    };
+    chrono::DateTime::parse_from_rfc3339(blocked_until)
+        .map(|dt| dt.with_timezone(&chrono::Utc) > chrono::Utc::now())
+        .unwrap_or(true)
+}
+
+fn raw_model_health_entry_is_quota_blocked(entry: &serde_json::Value, capability: &str) -> bool {
+    let status = entry
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    if status.eq_ignore_ascii_case("quota_blocked") {
+        return true;
+    }
+    if !status.eq_ignore_ascii_case("failed") {
+        return false;
+    }
+    let requested = entry
+        .get("requestedModel")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let actual = entry
+        .get("actualModel")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    if requested != capability || actual != capability {
+        return false;
+    }
+    let message = entry
+        .get("errorMessage")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    message.contains("quota exhausted")
+        || message.contains("quota_exhausted")
+        || message.contains("usage limit")
+        || message.contains("usage_limit")
+        || message.contains("weekly limit")
+        || message.contains("monthly limit")
+        || message.contains("no credits")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3551,7 +3651,7 @@ mod tests {
         classify_upstream_failure, commission_amount, commission_split, inject_openai_stream_usage,
         is_allowed_router_market_proxy_header, is_retryable_failure, looks_like_sse,
         parse_gemini_model_action, parse_non_stream_sse_fallback, quota_exhausted_ttl_secs,
-        rendezvous_share_score, share_subdomain, share_weight,
+        raw_share_app_quota_blocked, rendezvous_share_score, share_subdomain, share_weight,
     };
     use crate::{auth::ApiKeyPrincipal, failure::FailureKind, pricing, usage::UsageProtocol};
     use rust_decimal::Decimal;
@@ -3751,6 +3851,39 @@ mod tests {
             Some("bbb")
         );
         assert_eq!(share_subdomain(Some(r#"{"shareId":"share-1"}"#)), None);
+    }
+
+    #[test]
+    fn raw_share_app_quota_blocked_detects_router_unavailable_state() {
+        let raw = json!({
+            "appAvailability": {
+                "codex": {
+                    "status": "unavailable",
+                    "reason": "weekly quota exhausted"
+                }
+            }
+        })
+        .to_string();
+
+        assert!(raw_share_app_quota_blocked(Some(&raw), "codex"));
+        assert!(!raw_share_app_quota_blocked(Some(&raw), "claude"));
+    }
+
+    #[test]
+    fn raw_share_app_quota_blocked_detects_model_health_quota_block() {
+        let raw = json!({
+            "modelHealth": {
+                "codex": [{
+                    "status": "failed",
+                    "requestedModel": "codex",
+                    "actualModel": "codex",
+                    "errorMessage": "weekly quota exhausted until 2026-06-16T06:37:16+00:00"
+                }]
+            }
+        })
+        .to_string();
+
+        assert!(raw_share_app_quota_blocked(Some(&raw), "codex"));
     }
 
     #[test]

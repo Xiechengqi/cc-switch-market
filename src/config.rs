@@ -43,7 +43,6 @@ pub struct Config {
     pub router_base_domain: String,
     pub router_market_subdomain: String,
     pub router_api_base_url: String,
-    pub market_display_name: String,
     pub dodo_api_base: String,
     pub dodo_api_key: String,
     pub dodo_product_id: String,
@@ -156,7 +155,6 @@ impl Config {
             router_base_domain,
             router_market_subdomain,
             router_api_base_url,
-            market_display_name: env("MARKET_DISPLAY_NAME", "Main Market"),
             dodo_api_base: env("DODO_API_BASE", "https://test.dodopayments.com"),
             dodo_api_key: env("DODO_API_KEY", ""),
             dodo_product_id: env("DODO_PRODUCT_ID", ""),
@@ -399,10 +397,6 @@ impl Config {
             (
                 "ROUTER_MARKET_SUBDOMAIN".into(),
                 self.router_market_subdomain.clone(),
-            ),
-            (
-                "MARKET_DISPLAY_NAME".into(),
-                self.market_display_name.clone(),
             ),
             (
                 "DODO_WEBHOOK_SECRET".into(),

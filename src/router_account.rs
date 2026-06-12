@@ -225,7 +225,6 @@ pub async fn register_market(
         .bearer_auth(&session.access_token)
         .json(&serde_json::json!({
             "subdomain": config.router_market_subdomain,
-            "displayName": config.market_display_name,
             "publicBaseUrl": config.market_public_base_url,
             "pricingSummary": pricing_summary,
         }))

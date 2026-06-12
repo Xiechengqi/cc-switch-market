@@ -75,7 +75,6 @@ pub async fn version() -> Json<Version> {
 
 #[derive(Serialize)]
 pub struct PublicInfo {
-    market_display_name: String,
     market_public_base_url: String,
     auth_provider: &'static str,
     supports_claim: bool,
@@ -85,7 +84,6 @@ pub struct PublicInfo {
 
 pub async fn public_info(State(state): State<AppState>) -> Json<PublicInfo> {
     Json(PublicInfo {
-        market_display_name: state.config.market_display_name,
         market_public_base_url: state.config.market_public_base_url,
         auth_provider: "router_resend",
         supports_claim: true,

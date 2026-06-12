@@ -210,13 +210,6 @@ const FIELDS: &[Field] = &[
         required: true,
     },
     Field {
-        key: "MARKET_DISPLAY_NAME",
-        prompt: "Market display name",
-        default: "Main Market",
-        kind: FieldKind::Text,
-        required: true,
-    },
-    Field {
         key: "DODO_API_BASE",
         prompt: "Dodo API base",
         default: "https://test.dodopayments.com",

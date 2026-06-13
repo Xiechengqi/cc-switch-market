@@ -170,7 +170,7 @@ pub async fn kpis(
     let online_shares_row = state
         .db()
         .query_one(
-            "SELECT COUNT(*) AS count FROM router_shares WHERE online = 1 AND share_status='active' AND for_sale='Yes' AND COALESCE(disabled_by_market, 0) = 0",
+            "SELECT COUNT(*) AS count FROM router_shares WHERE online = 1 AND share_status='active' AND COALESCE(disabled_by_market, 0) = 0",
             vec![],
         )
         .await?;

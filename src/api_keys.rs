@@ -128,6 +128,37 @@ pub struct AvailableSharesResponse {
     pub items: Vec<AvailableShareItem>,
 }
 
+fn token_sale_capabilities(row: &crate::db::DbRow, market_email: Option<&str>) -> Vec<String> {
+    let raw_json = row.opt_string("raw_json");
+    let mut capabilities = Vec::new();
+    for (app, enabled) in [
+        (
+            "claude",
+            row.bool("enabled_claude") || row.string("app_type") == "claude",
+        ),
+        (
+            "codex",
+            row.bool("enabled_codex") || row.string("app_type") == "codex",
+        ),
+        (
+            "gemini",
+            row.bool("enabled_gemini") || row.string("app_type") == "gemini",
+        ),
+    ] {
+        if enabled
+            && crate::proxy::raw_share_app_token_sale_visible(
+                raw_json.as_deref(),
+                app,
+                &row.string("for_sale"),
+                market_email,
+            )
+        {
+            capabilities.push(app.to_string());
+        }
+    }
+    capabilities
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct PersistedSecretRow {
     api_key_id: Uuid,
@@ -486,6 +517,7 @@ pub async fn available_shares_endpoint(
     State(state): State<AppState>,
     _principal: Principal,
 ) -> Result<Json<AvailableSharesResponse>, ApiError> {
+    let market_email = state.market_runtime.read().await.owner_email.clone();
     let rows = state
         .db()
         .query_all(
@@ -493,9 +525,10 @@ pub async fn available_shares_endpoint(
             SELECT router_id, share_id,
                    COALESCE(owner_email, installation_owner_email) AS owner_email,
                    COALESCE(NULLIF(subdomain, ''), json_extract(raw_json, '$.subdomain')) AS subdomain,
-                   app_type, enabled_codex, enabled_claude, enabled_gemini, online, for_sale, share_status
+                   app_type, enabled_codex, enabled_claude, enabled_gemini, online, for_sale, share_status,
+                   raw_json
               FROM router_shares
-             WHERE for_sale = 'Yes' AND share_status = 'active' AND COALESCE(disabled_by_market, 0) = 0
+             WHERE share_status = 'active' AND COALESCE(disabled_by_market, 0) = 0
              ORDER BY online DESC, COALESCE(NULLIF(subdomain, ''), json_extract(raw_json, '$.subdomain')) ASC, router_id ASC, share_id ASC
             "#,
             vec![],
@@ -503,16 +536,10 @@ pub async fn available_shares_endpoint(
         .await?;
     let items = rows
         .into_iter()
-        .map(|row| {
-            let mut capabilities = vec![row.string("app_type")];
-            if row.bool("enabled_codex") && !capabilities.iter().any(|value| value == "codex") {
-                capabilities.push("codex".to_string());
-            }
-            if row.bool("enabled_claude") && !capabilities.iter().any(|value| value == "claude") {
-                capabilities.push("claude".to_string());
-            }
-            if row.bool("enabled_gemini") && !capabilities.iter().any(|value| value == "gemini") {
-                capabilities.push("gemini".to_string());
+        .filter_map(|row| {
+            let capabilities = token_sale_capabilities(&row, market_email.as_deref());
+            if capabilities.is_empty() {
+                return None;
             }
             AvailableShareItem {
                 router_id: row.string("router_id"),
@@ -525,6 +552,7 @@ pub async fn available_shares_endpoint(
                 for_sale: row.string("for_sale"),
                 share_status: row.string("share_status"),
             }
+            .into()
         })
         .collect();
     Ok(Json(AvailableSharesResponse { items }))
@@ -536,17 +564,18 @@ pub async fn get_api_key_share_allowlist_endpoint(
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiKeyShareAllowlistResponse>, ApiError> {
     ensure_api_key_owner(&state, principal.user_id, id).await?;
+    let market_email = state.market_runtime.read().await.owner_email.clone();
     let rows = state
         .db()
         .query_all(
             r#"
-            SELECT aks.router_id, aks.share_id
+            SELECT aks.router_id, aks.share_id,
+                   rs.app_type, rs.enabled_codex, rs.enabled_claude, rs.enabled_gemini, rs.for_sale, rs.raw_json
               FROM market_api_key_share_allowlist aks
               JOIN router_shares rs
                 ON rs.router_id = aks.router_id
                AND rs.share_id = aks.share_id
              WHERE aks.api_key_id = ?1
-               AND rs.for_sale = 'Yes'
                AND rs.share_status = 'active'
                AND COALESCE(rs.disabled_by_market, 0) = 0
              ORDER BY aks.router_id ASC, aks.share_id ASC
@@ -557,6 +586,7 @@ pub async fn get_api_key_share_allowlist_endpoint(
     Ok(Json(ApiKeyShareAllowlistResponse {
         shares: rows
             .into_iter()
+            .filter(|row| !token_sale_capabilities(row, market_email.as_deref()).is_empty())
             .map(|row| ApiKeyShareRef {
                 router_id: row.string("router_id"),
                 share_id: row.string("share_id"),
@@ -572,6 +602,7 @@ pub async fn set_api_key_share_allowlist_endpoint(
     Json(input): Json<ApiKeyShareAllowlistUpdateRequest>,
 ) -> Result<Json<ApiKeyShareAllowlistResponse>, ApiError> {
     ensure_api_key_owner(&state, principal.user_id, id).await?;
+    let market_email = state.market_runtime.read().await.owner_email.clone();
     let mut shares = input
         .shares
         .into_iter()
@@ -592,11 +623,14 @@ pub async fn set_api_key_share_allowlist_endpoint(
         let exists = state
             .db()
             .query_optional(
-                "SELECT 1 AS found FROM router_shares WHERE router_id=?1 AND share_id=?2 AND for_sale='Yes' AND share_status='active' AND COALESCE(disabled_by_market, 0) = 0 LIMIT 1",
+                "SELECT app_type, enabled_codex, enabled_claude, enabled_gemini, for_sale, raw_json FROM router_shares WHERE router_id=?1 AND share_id=?2 AND share_status='active' AND COALESCE(disabled_by_market, 0) = 0 LIMIT 1",
                 vec![crate::db::val(&share.router_id), crate::db::val(&share.share_id)],
             )
             .await?;
-        if exists.is_none() {
+        if exists
+            .as_ref()
+            .is_none_or(|row| token_sale_capabilities(row, market_email.as_deref()).is_empty())
+        {
             return Err(ApiError::bad_request(
                 "share_not_available",
                 format!(

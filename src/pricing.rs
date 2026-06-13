@@ -940,7 +940,7 @@ async fn model_item_from_row(
                 OR (?3 = 1 AND enabled_codex = 1)
                 OR (?4 = 1 AND enabled_claude = 1)
                 OR (?5 = 1 AND enabled_gemini = 1))
-           AND online=1 AND share_status='active' AND for_sale='Yes'
+           AND online=1 AND share_status='active'
            AND COALESCE(disabled_by_market, 0) = 0
         "#,
             vec![
@@ -1222,12 +1222,13 @@ pub async fn route_candidates(
         SELECT router_id, share_id, COALESCE(owner_email, installation_owner_email) AS owner_email,
                app_type, active_requests, parallel_limit, online_rate_24h, priority,
                enabled_claude, enabled_codex, enabled_gemini, last_success_at, last_seen_at
+               , raw_json, for_sale
           FROM router_shares
          WHERE (app_type IN (?1, ?3)
                 OR (?4 = 1 AND enabled_codex = 1)
                 OR (?5 = 1 AND enabled_claude = 1)
                 OR (?6 = 1 AND enabled_gemini = 1))
-           AND online=1 AND share_status='active' AND for_sale='Yes'
+           AND online=1 AND share_status='active'
            AND COALESCE(disabled_by_market, 0) = 0
            AND (parallel_limit = -1 OR active_requests < parallel_limit)
            AND COALESCE(owner_email, installation_owner_email) IS NOT NULL
@@ -1281,7 +1282,18 @@ pub async fn route_candidates(
     }
     sql.push_str(" ORDER BY active_requests ASC, priority DESC, CAST(online_rate_24h AS REAL) DESC, COALESCE(last_success_at, last_seen_at) DESC LIMIT 20");
     let rows = db.query_all(&sql, params).await?;
-    Ok(rows.into_iter().map(|row| row.to_json()).collect())
+    Ok(rows
+        .into_iter()
+        .filter(|row| {
+            crate::proxy::raw_share_app_token_sale_visible(
+                row.opt_string("raw_json").as_deref(),
+                capability,
+                &row.string("for_sale"),
+                None,
+            )
+        })
+        .map(|row| row.to_json())
+        .collect())
 }
 
 async fn route_diagnostics(
@@ -1300,7 +1312,7 @@ async fn route_diagnostics(
                app_type, online, share_status, for_sale, active_requests, parallel_limit,
                online_rate_24h, priority, enabled_claude, enabled_codex, enabled_gemini,
                last_error_at, cooldown_until, failure_count,
-               last_success_at, last_seen_at
+               last_success_at, last_seen_at, raw_json
           FROM router_shares
          WHERE (app_type IN (?1, ?2)
                 OR (?3 = 1 AND enabled_codex = 1)
@@ -1353,7 +1365,12 @@ async fn route_diagnostics(
         let json = row.to_json();
         if !row.bool("online")
             || row.string("share_status") != "active"
-            || row.string("for_sale") != "Yes"
+            || !crate::proxy::raw_share_app_token_sale_visible(
+                row.opt_string("raw_json").as_deref(),
+                capability,
+                &row.string("for_sale"),
+                None,
+            )
             || row.string("owner_email").is_empty()
         {
             excluded_offline.push(json);

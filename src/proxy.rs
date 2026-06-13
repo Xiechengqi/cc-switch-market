@@ -243,7 +243,9 @@ async fn handle_llm_request_with_model(
         .and_then(|v| v.as_u64())
         .unwrap_or(64)
         .min(4096);
-    let mut candidates = select_share_candidates(db, &api, app_type, &model, 20).await?;
+    let market_email = state.market_runtime.read().await.owner_email.clone();
+    let mut candidates =
+        select_share_candidates(db, &api, market_email.as_deref(), app_type, &model, 20).await?;
     let model_id = candidates
         .first()
         .and_then(|share| share.price.model_id)
@@ -2792,6 +2794,7 @@ struct SelectedShare {
 async fn select_share_candidates(
     db: &crate::db::Db,
     api: &ApiKeyPrincipal,
+    market_email: Option<&str>,
     app_type: &str,
     model: &str,
     limit: i64,
@@ -2846,7 +2849,7 @@ async fn select_share_candidates(
                 OR (?9 = 1 AND enabled_codex = 1)
                 OR (?10 = 1 AND enabled_claude = 1)
                 OR (?11 = 1 AND enabled_gemini = 1))
-           AND online = 1 AND share_status = 'active' AND for_sale = 'Yes'
+           AND online = 1 AND share_status = 'active'
            AND COALESCE(disabled_by_market, 0) = 0
            AND (parallel_limit = -1 OR active_requests < parallel_limit)
            AND COALESCE(owner_email, installation_owner_email) IS NOT NULL
@@ -2937,6 +2940,15 @@ async fn select_share_candidates(
         let router_id = row.string("router_id");
         let share_id = row.string("share_id");
         let raw_json = row.opt_string("raw_json");
+        if !raw_share_app_token_sale_visible(raw_json.as_deref(), capability, "Yes", market_email) {
+            tracing::debug!(
+                %router_id,
+                %share_id,
+                capability,
+                "skip router share not listed for token market on requested app"
+            );
+            continue;
+        }
         if raw_share_app_quota_blocked(raw_json.as_deref(), capability) {
             tracing::debug!(
                 %router_id,
@@ -3004,7 +3016,7 @@ async fn select_share_candidates(
                         OR (?3 = 1 AND enabled_codex = 1)
                         OR (?4 = 1 AND enabled_claude = 1)
                         OR (?5 = 1 AND enabled_gemini = 1))
-                   AND online = 1 AND share_status = 'active' AND for_sale = 'Yes'
+                   AND online = 1 AND share_status = 'active'
                    AND COALESCE(disabled_by_market, 0) = 1
                 "#,
                 vec![
@@ -3047,6 +3059,78 @@ fn share_sale_percent_from_raw(raw_json: &Option<String>, capability: &str) -> O
         .as_u64()
         .and_then(|value| u16::try_from(value).ok())
         .filter(|value| (1..=100).contains(value))
+}
+
+pub(crate) fn raw_share_app_token_sale_visible(
+    raw_json: Option<&str>,
+    capability: &str,
+    legacy_for_sale: &str,
+    market_email: Option<&str>,
+) -> bool {
+    let Some(raw) = raw_json else {
+        return legacy_for_sale == "Yes";
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return legacy_for_sale == "Yes";
+    };
+    if let Some(market_apps) = value.get("marketApps").and_then(|apps| apps.as_object()) {
+        let Some(app) = market_apps.get(capability) else {
+            return false;
+        };
+        return app
+            .get("supported")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true)
+            && app
+                .get("visible")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            && app
+                .get("forSale")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value == "Yes")
+            && app
+                .get("saleMarketKind")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value == "token");
+    }
+    if let Some(app) = value
+        .get("appSettings")
+        .and_then(|settings| settings.get(capability))
+    {
+        let listed = app
+            .get("forSale")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value == "Yes")
+            && app
+                .get("saleMarketKind")
+                .and_then(|value| value.as_str())
+                .is_none_or(|value| value == "token");
+        if !listed {
+            return false;
+        }
+        let mode = app
+            .get("marketAccessMode")
+            .and_then(|value| value.as_str())
+            .unwrap_or("selected");
+        if mode == "all" {
+            return true;
+        }
+        let Some(market_email) = market_email else {
+            return false;
+        };
+        return app
+            .get("sharedWithEmails")
+            .and_then(|value| value.as_array())
+            .is_some_and(|emails| {
+                emails.iter().any(|email| {
+                    email
+                        .as_str()
+                        .is_some_and(|email| email.eq_ignore_ascii_case(market_email))
+                })
+            });
+    }
+    legacy_for_sale == "Yes"
 }
 
 fn raw_share_app_quota_blocked(raw_json: Option<&str>, capability: &str) -> bool {
@@ -3651,7 +3735,8 @@ mod tests {
         classify_upstream_failure, commission_amount, commission_split, inject_openai_stream_usage,
         is_allowed_router_market_proxy_header, is_retryable_failure, looks_like_sse,
         parse_gemini_model_action, parse_non_stream_sse_fallback, quota_exhausted_ttl_secs,
-        raw_share_app_quota_blocked, rendezvous_share_score, share_subdomain, share_weight,
+        raw_share_app_quota_blocked, raw_share_app_token_sale_visible, rendezvous_share_score,
+        share_subdomain, share_weight,
     };
     use crate::{auth::ApiKeyPrincipal, failure::FailureKind, pricing, usage::UsageProtocol};
     use rust_decimal::Decimal;
@@ -3867,6 +3952,87 @@ mod tests {
 
         assert!(raw_share_app_quota_blocked(Some(&raw), "codex"));
         assert!(!raw_share_app_quota_blocked(Some(&raw), "claude"));
+    }
+
+    #[test]
+    fn raw_share_app_token_sale_visible_uses_market_apps() {
+        let raw = json!({
+            "marketApps": {
+                "codex": {
+                    "supported": true,
+                    "visible": true,
+                    "forSale": "Yes",
+                    "saleMarketKind": "token",
+                    "marketAccessMode": "all"
+                },
+                "claude": {
+                    "supported": true,
+                    "visible": true,
+                    "forSale": "Yes",
+                    "saleMarketKind": "share",
+                    "marketAccessMode": "selected"
+                }
+            }
+        })
+        .to_string();
+
+        assert!(raw_share_app_token_sale_visible(
+            Some(&raw),
+            "codex",
+            "Yes",
+            None
+        ));
+        assert!(!raw_share_app_token_sale_visible(
+            Some(&raw),
+            "claude",
+            "Yes",
+            None
+        ));
+        assert!(!raw_share_app_token_sale_visible(
+            Some(&raw),
+            "gemini",
+            "Yes",
+            None
+        ));
+    }
+
+    #[test]
+    fn raw_share_app_token_sale_visible_checks_app_settings_market_acl() {
+        let raw = json!({
+            "appSettings": {
+                "codex": {
+                    "forSale": "Yes",
+                    "saleMarketKind": "token",
+                    "marketAccessMode": "selected",
+                    "sharedWithEmails": ["market@example.com"]
+                },
+                "claude": {
+                    "forSale": "Yes",
+                    "saleMarketKind": "token",
+                    "marketAccessMode": "all"
+                }
+            }
+        })
+        .to_string();
+
+        assert!(raw_share_app_token_sale_visible(
+            Some(&raw),
+            "codex",
+            "No",
+            Some("market@example.com")
+        ));
+        assert!(!raw_share_app_token_sale_visible(
+            Some(&raw),
+            "codex",
+            "No",
+            Some("other@example.com")
+        ));
+        assert!(raw_share_app_token_sale_visible(
+            Some(&raw),
+            "claude",
+            "No",
+            None
+        ));
     }
 
     #[test]

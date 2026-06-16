@@ -37,7 +37,7 @@ use anyhow::Context;
 use axum::{
     Router,
     body::Body,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::Request,
     middleware,
     middleware::Next,
@@ -48,6 +48,8 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{app_state::AppState, config::Config};
+
+const REQUEST_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -519,6 +521,7 @@ fn build_router(state: AppState) -> Router {
             auth::csrf_middleware,
         ))
         .layer(CorsLayer::permissive())
+        .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES))
         .layer(TraceLayer::new_for_http())
 }
 

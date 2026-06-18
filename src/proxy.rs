@@ -47,6 +47,50 @@ pub struct UsageQuery {
     pub status: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct ShareSessionLoadsQuery {
+    pub app: Option<String>,
+    pub app_type: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareSessionLoad {
+    pub router_id: String,
+    pub share_id: String,
+    pub session_load: i64,
+}
+
+#[derive(Clone)]
+struct StickyRouteScope {
+    sticky_key: String,
+    app_type: String,
+}
+
+impl StickyRouteScope {
+    fn new(
+        user_id: Uuid,
+        api_key_id: Uuid,
+        app_type: &str,
+        model_id: Uuid,
+        protocol_family: &str,
+        session_key: String,
+    ) -> Self {
+        let sticky_key = sticky_route_key(
+            user_id,
+            api_key_id,
+            app_type,
+            model_id,
+            protocol_family,
+            &session_key,
+        );
+        Self {
+            sticky_key,
+            app_type: app_type.to_string(),
+        }
+    }
+}
+
 pub async fn usage(
     State(state): State<AppState>,
     principal: crate::auth::Principal,
@@ -107,6 +151,41 @@ pub async fn usage(
                 .to_string()
         },
     )))
+}
+
+pub async fn share_session_loads(
+    State(state): State<AppState>,
+    Query(query): Query<ShareSessionLoadsQuery>,
+) -> Result<Json<Vec<ShareSessionLoad>>, ApiError> {
+    let app_type = query
+        .app
+        .or(query.app_type)
+        .map(|value| share_capability(&value).to_string());
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut sql = r#"
+        SELECT router_id, share_id, COUNT(*) AS session_load
+          FROM market_share_sticky_routes
+         WHERE expires_at > ?1
+        "#
+    .to_string();
+    let mut params = vec![crate::db::val(&now)];
+    if let Some(app_type) = app_type {
+        sql.push_str(" AND app_type = ?2");
+        params.push(crate::db::val(app_type));
+    }
+    sql.push_str(
+        " GROUP BY router_id, share_id ORDER BY session_load ASC, router_id ASC, share_id ASC",
+    );
+    let rows = state.db().query_all(&sql, params).await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| ShareSessionLoad {
+                router_id: row.string("router_id"),
+                share_id: row.string("share_id"),
+                session_load: row.i64("session_load"),
+            })
+            .collect(),
+    ))
 }
 
 pub async fn chat_completions(
@@ -244,8 +323,15 @@ async fn handle_llm_request_with_model(
         .unwrap_or(64)
         .min(4096);
     let market_email = state.market_runtime.read().await.owner_email.clone();
-    let mut candidates =
-        select_share_candidates(db, &api, market_email.as_deref(), app_type, &model, 20).await?;
+    let mut candidates = select_share_candidates_with_sync_retry(
+        &state,
+        &api,
+        market_email.as_deref(),
+        app_type,
+        &model,
+        100,
+    )
+    .await?;
     let model_id = candidates
         .first()
         .and_then(|share| share.price.model_id)
@@ -264,14 +350,17 @@ async fn handle_llm_request_with_model(
         upstream_path
     };
     let protocol_family = protocol_family(app_type, upstream_path);
-    let sticky_key = sticky_route_key(
+    let sticky_app_type = share_capability(app_type).to_string();
+    let session_key = request_session_key(&meta.headers, &body_json, &body);
+    let sticky_scope = StickyRouteScope::new(
         api.user_id,
         api.api_key_id,
-        app_type,
+        &sticky_app_type,
         model_id,
         protocol_family,
+        session_key,
     );
-    candidates = order_share_candidates(&state, &sticky_key, candidates).await?;
+    candidates = order_share_candidates(&state, &sticky_scope, candidates).await?;
     candidates.truncate(3);
     let share = candidates.first().cloned().ok_or_else(|| {
         ApiError::service_unavailable(format!(
@@ -375,8 +464,8 @@ async fn handle_llm_request_with_model(
             upstream_path,
             now,
             usage_protocol,
-            sticky_key,
-            app_type.to_string(),
+            sticky_scope.sticky_key,
+            sticky_scope.app_type.clone(),
             protocol_family.to_string(),
             model_id,
         )
@@ -391,7 +480,7 @@ async fn handle_llm_request_with_model(
         charge_id,
         &request_id,
         upstream_path,
-        Some(&sticky_key),
+        Some(&sticky_scope.sticky_key),
     )
     .await
     {
@@ -462,10 +551,10 @@ async fn handle_llm_request_with_model(
     };
     refresh_sticky_route(
         &state,
-        Some(&sticky_key),
+        Some(&sticky_scope.sticky_key),
         api.user_id,
         api.api_key_id,
-        app_type,
+        &sticky_scope.app_type,
         model_id,
         protocol_family,
         &upstream_share,
@@ -2791,6 +2880,50 @@ struct SelectedShare {
     price: pricing::PriceItem,
 }
 
+async fn select_share_candidates_with_sync_retry(
+    state: &AppState,
+    api: &ApiKeyPrincipal,
+    market_email: Option<&str>,
+    app_type: &str,
+    model: &str,
+    limit: i64,
+) -> Result<Vec<SelectedShare>, ApiError> {
+    match select_share_candidates(state.db(), api, market_email, app_type, model, limit).await {
+        Ok(candidates) => Ok(candidates),
+        Err(err) if should_retry_after_share_sync(&err) => {
+            tracing::info!(
+                app_type,
+                model,
+                "no local router share candidate; syncing router shares before retry"
+            );
+            if let Err(sync_err) = crate::router_client::sync_shares(state).await {
+                tracing::warn!(
+                    error = %sync_err,
+                    app_type,
+                    model,
+                    "router share sync retry failed"
+                );
+                return Err(err);
+            }
+            select_share_candidates(state.db(), api, market_email, app_type, model, limit).await
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn should_retry_after_share_sync(err: &ApiError) -> bool {
+    matches!(
+        err,
+        ApiError::Http {
+            status,
+            code: "service_unavailable",
+            message,
+            ..
+        } if *status == StatusCode::SERVICE_UNAVAILABLE
+            && message.contains("no available router share")
+    )
+}
+
 async fn select_share_candidates(
     db: &crate::db::Db,
     api: &ApiKeyPrincipal,
@@ -2967,6 +3100,7 @@ async fn select_share_candidates(
                 requested_slot,
                 model,
                 request_price.as_ref(),
+                raw_json.as_deref(),
             )
             .await?
         else {
@@ -3232,6 +3366,7 @@ async fn resolve_share_pricing(
     requested_slot: &str,
     request_model: &str,
     request_price: Option<&pricing::PriceItem>,
+    raw_json: Option<&str>,
 ) -> Result<Option<(String, String, String, bool, pricing::PriceItem)>, ApiError> {
     let support = db
         .query_optional(
@@ -3251,6 +3386,18 @@ async fn resolve_share_pricing(
         )
         .await?;
     let Some(support) = support else {
+        if raw_share_app_official_runtime(raw_json, capability) {
+            let Some(price) = request_price.cloned() else {
+                return Ok(None);
+            };
+            return Ok(Some((
+                request_model.to_string(),
+                requested_slot.to_string(),
+                "official_runtime_raw".to_string(),
+                true,
+                price,
+            )));
+        }
         return Ok(None);
     };
     if support.bool("official") {
@@ -3282,6 +3429,21 @@ async fn resolve_share_pricing(
         false,
         price,
     )))
+}
+
+fn raw_share_app_official_runtime(raw_json: Option<&str>, capability: &str) -> bool {
+    let Some(raw) = raw_json else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    value
+        .get("appRuntimes")
+        .and_then(|runtimes| runtimes.get(capability))
+        .and_then(|runtime| runtime.get("kind"))
+        .and_then(|kind| kind.as_str())
+        .is_some_and(|kind| kind == "official_oauth")
 }
 
 fn requested_model_slot(capability: &str, model: &str) -> &'static str {
@@ -3377,21 +3539,29 @@ fn default_agent_model_vendors(capability: &str) -> Vec<String> {
 
 async fn order_share_candidates(
     state: &AppState,
-    sticky_key: &str,
+    sticky_scope: &StickyRouteScope,
     mut candidates: Vec<SelectedShare>,
 ) -> Result<Vec<SelectedShare>, ApiError> {
     if candidates.len() <= 1 || !state.config.market_share_sticky_enabled {
         return Ok(candidates);
     }
     let now = chrono::Utc::now().to_rfc3339();
+    let _ = state
+        .db()
+        .execute(
+            "DELETE FROM market_share_sticky_routes WHERE expires_at <= ?1",
+            vec![crate::db::val(&now)],
+        )
+        .await;
     let sticky = state
         .db()
         .query_optional(
             "SELECT router_id, share_id FROM market_share_sticky_routes WHERE sticky_key=?1 AND expires_at>?2 LIMIT 1",
-            vec![crate::db::val(sticky_key), crate::db::val(&now)],
+            vec![crate::db::val(&sticky_scope.sticky_key), crate::db::val(&now)],
         )
         .await?;
     let sticky_pair = sticky.map(|row| (row.string("router_id"), row.string("share_id")));
+    let session_loads = share_session_loads_for_app(state, &sticky_scope.app_type, &now).await?;
     candidates.sort_by(|a, b| {
         let a_sticky = sticky_pair
             .as_ref()
@@ -3399,23 +3569,54 @@ async fn order_share_candidates(
         let b_sticky = sticky_pair
             .as_ref()
             .is_some_and(|(router, share)| router == &b.router_id && share == &b.share_id);
+        let a_session_load = session_loads
+            .get(&(a.router_id.clone(), a.share_id.clone()))
+            .copied()
+            .unwrap_or(0);
+        let b_session_load = session_loads
+            .get(&(b.router_id.clone(), b.share_id.clone()))
+            .copied()
+            .unwrap_or(0);
         b_sticky
             .cmp(&a_sticky)
+            .then_with(|| a_session_load.cmp(&b_session_load))
+            .then_with(|| a.active_requests.cmp(&b.active_requests))
             .then_with(|| {
-                rendezvous_share_score(sticky_key, b)
-                    .total_cmp(&rendezvous_share_score(sticky_key, a))
+                rendezvous_share_score(&sticky_scope.sticky_key, b)
+                    .total_cmp(&rendezvous_share_score(&sticky_scope.sticky_key, a))
             })
             .then_with(|| a.router_id.cmp(&b.router_id))
             .then_with(|| a.share_id.cmp(&b.share_id))
     });
-    let _ = state
-        .db()
-        .execute(
-            "DELETE FROM market_share_sticky_routes WHERE expires_at <= ?1",
-            vec![crate::db::val(now)],
-        )
-        .await;
     Ok(candidates)
+}
+
+async fn share_session_loads_for_app(
+    state: &AppState,
+    app_type: &str,
+    now: &str,
+) -> Result<std::collections::HashMap<(String, String), i64>, ApiError> {
+    let rows = state
+        .db()
+        .query_all(
+            r#"
+            SELECT router_id, share_id, COUNT(*) AS session_load
+              FROM market_share_sticky_routes
+             WHERE app_type=?1 AND expires_at>?2
+             GROUP BY router_id, share_id
+            "#,
+            vec![crate::db::val(app_type), crate::db::val(now)],
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                (row.string("router_id"), row.string("share_id")),
+                row.i64("session_load"),
+            )
+        })
+        .collect())
 }
 
 fn rendezvous_share_score(sticky_key: &str, share: &SelectedShare) -> f64 {
@@ -3516,14 +3717,103 @@ async fn clear_sticky_route_for_share(
         .await;
 }
 
+fn request_session_key(headers: &HeaderMap, body_json: &serde_json::Value, body: &Bytes) -> String {
+    if let Some(value) = header_session_value(headers) {
+        return hash_session_key("header", &value);
+    }
+    for path in [
+        &["session_id"][..],
+        &["sessionId"][..],
+        &["conversation_id"][..],
+        &["conversationId"][..],
+        &["thread_id"][..],
+        &["threadId"][..],
+        &["metadata", "session_id"][..],
+        &["metadata", "sessionId"][..],
+        &["metadata", "conversation_id"][..],
+        &["metadata", "conversationId"][..],
+        &["user"][..],
+    ] {
+        if let Some(value) = json_string_path(body_json, path) {
+            return hash_session_key(&path.join("."), &value);
+        }
+    }
+    if let Some(value) = message_history_session_hint(body_json) {
+        return hash_session_key("messages", &value);
+    }
+    format!("sha256:{}", hex::encode(Sha256::digest(body)))
+}
+
+fn header_session_value(headers: &HeaderMap) -> Option<String> {
+    [
+        "x-cc-session-id",
+        "x-session-id",
+        "x-conversation-id",
+        "x-thread-id",
+        "openai-conversation-id",
+    ]
+    .iter()
+    .find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn json_string_path(value: &serde_json::Value, path: &[&str]) -> Option<String> {
+    let mut current = value;
+    for segment in path {
+        current = current.get(*segment)?;
+    }
+    current
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn message_history_session_hint(body_json: &serde_json::Value) -> Option<String> {
+    let messages = body_json.get("messages")?.as_array()?;
+    if messages.is_empty() {
+        return None;
+    }
+    let hint = messages
+        .iter()
+        .take(2)
+        .map(|message| {
+            let role = message
+                .get("role")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let content = message
+                .get("content")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            format!("{role}:{content}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!hint.trim().is_empty()).then_some(hint)
+}
+
+fn hash_session_key(source: &str, value: &str) -> String {
+    let raw = format!("{source}:{}", value.trim());
+    format!("sha256:{}", hex::encode(Sha256::digest(raw.as_bytes())))
+}
+
 fn sticky_route_key(
     user_id: Uuid,
     api_key_id: Uuid,
     app_type: &str,
     model_id: Uuid,
     protocol_family: &str,
+    session_key: &str,
 ) -> String {
-    let raw = format!("{user_id}:{api_key_id}:{app_type}:{model_id}:{protocol_family}");
+    let raw =
+        format!("{user_id}:{api_key_id}:{app_type}:{model_id}:{protocol_family}:{session_key}");
     format!("sha256:{}", hex::encode(Sha256::digest(raw.as_bytes())))
 }
 
@@ -3735,10 +4025,12 @@ mod tests {
         classify_upstream_failure, commission_amount, commission_split, inject_openai_stream_usage,
         is_allowed_router_market_proxy_header, is_retryable_failure, looks_like_sse,
         parse_gemini_model_action, parse_non_stream_sse_fallback, quota_exhausted_ttl_secs,
-        raw_share_app_quota_blocked, raw_share_app_token_sale_visible, rendezvous_share_score,
-        share_subdomain, share_weight,
+        raw_share_app_official_runtime, raw_share_app_quota_blocked,
+        raw_share_app_token_sale_visible, rendezvous_share_score, request_session_key,
+        share_subdomain, share_weight, sticky_route_key,
     };
     use crate::{auth::ApiKeyPrincipal, failure::FailureKind, pricing, usage::UsageProtocol};
+    use axum::{body::Bytes, http::HeaderMap};
     use rust_decimal::Decimal;
     use serde_json::json;
     use uuid::Uuid;
@@ -4033,6 +4325,98 @@ mod tests {
             "No",
             None
         ));
+    }
+
+    #[test]
+    fn raw_share_app_official_runtime_detects_runtime_kind() {
+        let raw = json!({
+            "appRuntimes": {
+                "codex": {
+                    "kind": "official_oauth",
+                    "app": "codex"
+                },
+                "claude": {
+                    "kind": "proxy",
+                    "app": "claude",
+                    "models": [{"slot": "sonnet", "actualModel": "claude-sonnet-4"}]
+                }
+            }
+        })
+        .to_string();
+
+        assert!(raw_share_app_official_runtime(Some(&raw), "codex"));
+        assert!(!raw_share_app_official_runtime(Some(&raw), "claude"));
+        assert!(!raw_share_app_official_runtime(Some(&raw), "gemini"));
+    }
+
+    #[test]
+    fn request_session_key_prefers_explicit_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", "session-a".parse().unwrap());
+        let body = Bytes::from_static(br#"{"metadata":{"session_id":"session-b"}}"#);
+        let body_json = json!({"metadata": {"session_id": "session-b"}});
+
+        assert_eq!(
+            request_session_key(&headers, &body_json, &body),
+            request_session_key(
+                &headers,
+                &json!({"user": "other"}),
+                &Bytes::from_static(b"{}")
+            )
+        );
+    }
+
+    #[test]
+    fn request_session_key_uses_metadata_and_request_fallback() {
+        let headers = HeaderMap::new();
+        let session_a = request_session_key(
+            &headers,
+            &json!({"metadata": {"session_id": "stable-session"}}),
+            &Bytes::from_static(br#"{"metadata":{"session_id":"stable-session"},"n":1}"#),
+        );
+        let session_b = request_session_key(
+            &headers,
+            &json!({"metadata": {"session_id": "stable-session"}}),
+            &Bytes::from_static(br#"{"metadata":{"session_id":"stable-session"},"n":2}"#),
+        );
+        let fallback_a = request_session_key(
+            &headers,
+            &json!({"input": "one"}),
+            &Bytes::from_static(br#"{"input":"one"}"#),
+        );
+        let fallback_b = request_session_key(
+            &headers,
+            &json!({"input": "two"}),
+            &Bytes::from_static(br#"{"input":"two"}"#),
+        );
+
+        assert_eq!(session_a, session_b);
+        assert_ne!(fallback_a, fallback_b);
+    }
+
+    #[test]
+    fn sticky_route_key_includes_session_key() {
+        let user_id = Uuid::nil();
+        let api_key_id = Uuid::nil();
+        let model_id = Uuid::nil();
+        let key_a = sticky_route_key(
+            user_id,
+            api_key_id,
+            "codex",
+            model_id,
+            "responses",
+            "session-a",
+        );
+        let key_b = sticky_route_key(
+            user_id,
+            api_key_id,
+            "codex",
+            model_id,
+            "responses",
+            "session-b",
+        );
+
+        assert_ne!(key_a, key_b);
     }
 
     #[test]

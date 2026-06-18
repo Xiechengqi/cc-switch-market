@@ -255,6 +255,10 @@ fn build_router(state: AppState) -> Router {
             get(dashboard::top_providers),
         )
         .route("/v1/public/dashboard/top-users", get(dashboard::top_users))
+        .route(
+            "/v1/public/share-session-loads",
+            get(proxy::share_session_loads),
+        )
         .route("/v1/metrics", get(types::metrics))
         .route("/docs", get(types::docs))
         .route(

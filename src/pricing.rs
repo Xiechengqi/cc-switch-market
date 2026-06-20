@@ -1441,8 +1441,8 @@ struct ShareSupportFlags {
 
 fn share_support_flags(app_type: &str) -> ShareSupportFlags {
     ShareSupportFlags {
-        claude: app_type == "anthropic" || app_type == "claude",
-        codex: app_type == "openai" || app_type == "codex",
+        claude: matches!(app_type, "anthropic" | "claude" | "cursor"),
+        codex: matches!(app_type, "openai" | "codex" | "cursor"),
         gemini: app_type == "gemini",
     }
 }

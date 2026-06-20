@@ -134,7 +134,7 @@ type TicketItem = {
 
 const USER_TABLE_PAGE_SIZE_KEY = "cc-switch-market:user-table-page-size";
 const USER_TABLE_PAGE_SIZE_OPTIONS = [10, 20, 50, 100];
-const AGENT_MODEL_VENDOR_OPTIONS = [
+const BASE_AGENT_MODEL_VENDOR_OPTIONS = [
   {
     agent: "claude",
     label: "Claude",
@@ -166,7 +166,7 @@ const AGENT_MODEL_VENDOR_OPTIONS = [
     ],
   },
 ] as const;
-const DEFAULT_AGENT_VENDOR_KEYS = ["claude:anthropic", "codex:openai", "gemini:gemini"];
+const DEFAULT_AGENT_VENDOR_KEYS = ["claude:anthropic", "claude:cursor", "codex:openai", "codex:cursor", "gemini:gemini"];
 const SCHEDULING_PROFILE_OPTIONS = [
   "balanced",
   "price-first",
@@ -177,6 +177,11 @@ const SCHEDULING_PROFILE_OPTIONS = [
   "budget-aware",
 ] as const;
 const DEFAULT_SCHEDULING_PROFILE = "balanced";
+type AgentModelVendorOption = {
+  agent: "claude" | "codex" | "gemini";
+  label: string;
+  vendors: Array<{ id: string; label: string }>;
+};
 
 function ConsoleDataTable<T>(props: DataTableProps<T>) {
   const { locale } = useLocale();
@@ -821,6 +826,7 @@ function EditKeyModal({ target, onClose, onDone }: { target: ApiKeyItem | null; 
 function ApiKeyLimitFields({ value, onChange, prices }: { value: ApiKeyLimitFormValue; onChange: (value: ApiKeyLimitFormValue) => void; prices: PriceItem[] | null }) {
   const { locale } = useLocale();
   const c = copy[locale].dashboard.keys;
+  const vendorOptions = agentModelVendorOptions(prices);
 
   function patch(next: Partial<ApiKeyLimitFormValue>) {
     onChange({ ...value, ...next });
@@ -888,7 +894,7 @@ function ApiKeyLimitFields({ value, onChange, prices }: { value: ApiKeyLimitForm
         </div>
         <div className="mt-3 grid gap-3 rounded-2xl border-2 border-slate-800 bg-amber-50 p-3">
           {prices === null && <div className="text-sm text-slate-500">{c.modelsLoading}</div>}
-          {prices && AGENT_MODEL_VENDOR_OPTIONS.map((agent) => (
+          {prices && vendorOptions.map((agent) => (
             <div key={agent.agent} className="rounded-xl border-2 border-slate-200 bg-white p-3">
               <div className="mb-2 text-sm font-black">{agent.label}</div>
               <div className="flex flex-wrap gap-2">
@@ -909,6 +915,71 @@ function ApiKeyLimitFields({ value, onChange, prices }: { value: ApiKeyLimitForm
       </div>
     </div>
   );
+}
+
+function agentModelVendorOptions(prices: PriceItem[] | null): AgentModelVendorOption[] {
+  const options: AgentModelVendorOption[] = BASE_AGENT_MODEL_VENDOR_OPTIONS.map((agent) => ({
+    agent: agent.agent,
+    label: agent.label,
+    vendors: agent.vendors.map((vendor) => ({ ...vendor })),
+  }));
+  if (!prices) return options;
+  const dynamicVendors = Array.from(new Set(
+    prices
+      .filter((price) => price.model_pattern !== "*")
+      .map((price) => normalizeVendorId(price.app_type))
+      .filter(Boolean),
+  ));
+  for (const vendor of dynamicVendors) {
+    for (const agent of agentsForVendor(vendor)) {
+      const option = options.find((item) => item.agent === agent);
+      if (!option || option.vendors.some((item) => item.id === vendor)) continue;
+      option.vendors.push({ id: vendor, label: vendorLabel(vendor) });
+    }
+  }
+  return options;
+}
+
+function agentsForVendor(vendor: string): Array<AgentModelVendorOption["agent"]> {
+  switch (vendor) {
+    case "anthropic":
+      return ["claude"];
+    case "openai":
+      return ["codex"];
+    case "gemini":
+      return ["gemini"];
+    case "cursor":
+      return ["claude", "codex"];
+    case "deepseek":
+      return ["claude", "codex", "gemini"];
+    default:
+      return ["claude", "codex", "gemini"];
+  }
+}
+
+function normalizeVendorId(value: string): string {
+  const vendor = value.trim().toLowerCase();
+  if (vendor === "claude") return "anthropic";
+  if (vendor === "codex") return "openai";
+  if (vendor === "google") return "gemini";
+  return vendor;
+}
+
+function vendorLabel(vendor: string): string {
+  switch (vendor) {
+    case "anthropic":
+      return "Anthropic";
+    case "openai":
+      return "OpenAI";
+    case "gemini":
+      return "Gemini";
+    case "deepseek":
+      return "DeepSeek";
+    case "cursor":
+      return "Cursor";
+    default:
+      return vendor.replace(/[-_]+/g, " ").replace(/\b\w/g, (char) => char.toUpperCase());
+  }
 }
 
 function emptyLimitForm(): ApiKeyLimitFormValue {

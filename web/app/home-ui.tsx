@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   ArrowRight,
   Coins,
@@ -45,9 +45,7 @@ type Price = {
   status?: string;
 };
 
-type PriceProvider = "anthropic" | "openai" | "gemini" | "deepseek";
-
-const PRICE_PROVIDERS: PriceProvider[] = ["anthropic", "openai", "gemini", "deepseek"];
+const DEFAULT_PRICE_PROVIDERS = ["anthropic", "openai", "gemini", "deepseek"];
 const PRICE_PAGE_SIZE = 6;
 
 export function HomeHero() {
@@ -257,11 +255,16 @@ export function PricingTable() {
   const c = copy[locale].landing;
   const publicConfig = usePublicConfig();
   const [prices, setPrices] = useState<Price[] | null>(null);
-  const [activeProvider, setActiveProvider] = useState<PriceProvider>("anthropic");
+  const [activeProvider, setActiveProvider] = useState("anthropic");
   const [page, setPage] = useState(0);
   useEffect(() => {
     apiGet<Price[]>("/v1/prices").then(setPrices).catch(() => setPrices([]));
   }, []);
+  const priceProviders = useMemo(() => priceProviderTabs(prices), [prices]);
+  useEffect(() => {
+    if (!prices || priceProviders.length === 0) return;
+    if (!priceProviders.includes(activeProvider)) setActiveProvider(priceProviders[0]);
+  }, [prices, priceProviders, activeProvider]);
   useEffect(() => {
     setPage(0);
   }, [activeProvider]);
@@ -289,7 +292,7 @@ export function PricingTable() {
       <h2 className="font-display text-4xl font-extrabold md:text-5xl">{c.pricingTitle}</h2>
       <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap gap-2">
-          {PRICE_PROVIDERS.map((provider) => {
+          {priceProviders.map((provider) => {
             const count = (prices ?? []).filter((price) => price.app_type === provider && price.model_pattern !== "*").length;
             return (
               <button
@@ -404,6 +407,15 @@ export function PricingTable() {
       )}
     </section>
   );
+}
+
+function priceProviderTabs(prices: Price[] | null): string[] {
+  if (!prices) return DEFAULT_PRICE_PROVIDERS;
+  const dynamic = prices
+    .filter((price) => price.model_pattern !== "*")
+    .map((price) => price.app_type)
+    .filter((provider): provider is string => Boolean(provider));
+  return Array.from(new Set([...DEFAULT_PRICE_PROVIDERS, ...dynamic]));
 }
 
 function Th({ children, align }: { children: React.ReactNode; align?: "right" }) {

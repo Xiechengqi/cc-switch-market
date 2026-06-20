@@ -3523,6 +3523,7 @@ fn normalize_model_vendor(value: &str) -> String {
         "anthropic" | "claude" => "anthropic".to_string(),
         "openai" | "codex" => "openai".to_string(),
         "google" | "gemini" => "gemini".to_string(),
+        "cursor" | "cursor_apikey" | "cursor-api-key" => "cursor".to_string(),
         "deepseek" => "deepseek".to_string(),
         other => other.to_string(),
     }
@@ -3530,8 +3531,8 @@ fn normalize_model_vendor(value: &str) -> String {
 
 fn default_agent_model_vendors(capability: &str) -> Vec<String> {
     match capability {
-        "claude" => vec!["anthropic".to_string()],
-        "codex" => vec!["openai".to_string()],
+        "claude" => vec!["anthropic".to_string(), "cursor".to_string()],
+        "codex" => vec!["openai".to_string(), "cursor".to_string()],
         "gemini" => vec!["gemini".to_string()],
         _ => Vec::new(),
     }
@@ -3845,8 +3846,8 @@ struct ShareSupportFlags {
 
 fn share_support_flags(app_type: &str) -> ShareSupportFlags {
     ShareSupportFlags {
-        claude: app_type == "anthropic" || app_type == "claude",
-        codex: app_type == "openai" || app_type == "codex",
+        claude: matches!(app_type, "anthropic" | "claude" | "cursor"),
+        codex: matches!(app_type, "openai" | "codex" | "cursor"),
         gemini: app_type == "gemini",
     }
 }

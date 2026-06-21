@@ -322,6 +322,23 @@ async fn handle_llm_request_with_model(
         .and_then(|v| v.as_u64())
         .unwrap_or(64)
         .min(4096);
+    let downstream_path = upstream_path.to_string();
+    let protocol_family = protocol_family(app_type, upstream_path);
+    let sticky_app_type = share_capability(app_type).to_string();
+    let session_key = request_session_key(&meta.headers, &body_json, &body);
+    let initial_model_id = pricing::match_price(db, app_type, &model)
+        .await
+        .ok()
+        .and_then(|price| price.model_id)
+        .unwrap_or_else(Uuid::nil);
+    let sticky_scope = StickyRouteScope::new(
+        api.user_id,
+        api.api_key_id,
+        &sticky_app_type,
+        initial_model_id,
+        protocol_family,
+        session_key,
+    );
     let market_email = state.market_runtime.read().await.owner_email.clone();
     let mut candidates = select_share_candidates_with_sync_retry(
         &state,
@@ -330,13 +347,9 @@ async fn handle_llm_request_with_model(
         app_type,
         &model,
         100,
+        Some(&sticky_scope.sticky_key),
     )
     .await?;
-    let model_id = candidates
-        .first()
-        .and_then(|share| share.price.model_id)
-        .ok_or_else(|| ApiError::bad_request("model_not_supported", "model is not supported"))?;
-    let downstream_path = upstream_path.to_string();
     let use_responses_upstream = candidates
         .first()
         .is_some_and(|share| share_uses_responses_for_openai_chat(share, app_type, upstream_path));
@@ -349,17 +362,6 @@ async fn handle_llm_request_with_model(
     } else {
         upstream_path
     };
-    let protocol_family = protocol_family(app_type, upstream_path);
-    let sticky_app_type = share_capability(app_type).to_string();
-    let session_key = request_session_key(&meta.headers, &body_json, &body);
-    let sticky_scope = StickyRouteScope::new(
-        api.user_id,
-        api.api_key_id,
-        &sticky_app_type,
-        model_id,
-        protocol_family,
-        session_key,
-    );
     candidates = order_share_candidates(&state, &sticky_scope, candidates).await?;
     candidates.truncate(3);
     let share = candidates.first().cloned().ok_or_else(|| {
@@ -2887,8 +2889,19 @@ async fn select_share_candidates_with_sync_retry(
     app_type: &str,
     model: &str,
     limit: i64,
+    sticky_key: Option<&str>,
 ) -> Result<Vec<SelectedShare>, ApiError> {
-    match select_share_candidates(state.db(), api, market_email, app_type, model, limit).await {
+    match select_share_candidates(
+        state.db(),
+        api,
+        market_email,
+        app_type,
+        model,
+        limit,
+        sticky_key,
+    )
+    .await
+    {
         Ok(candidates) => Ok(candidates),
         Err(err) if should_retry_after_share_sync(&err) => {
             tracing::info!(
@@ -2905,7 +2918,16 @@ async fn select_share_candidates_with_sync_retry(
                 );
                 return Err(err);
             }
-            select_share_candidates(state.db(), api, market_email, app_type, model, limit).await
+            select_share_candidates(
+                state.db(),
+                api,
+                market_email,
+                app_type,
+                model,
+                limit,
+                sticky_key,
+            )
+            .await
         }
         Err(err) => Err(err),
     }
@@ -2931,6 +2953,7 @@ async fn select_share_candidates(
     app_type: &str,
     model: &str,
     limit: i64,
+    sticky_key: Option<&str>,
 ) -> Result<Vec<SelectedShare>, ApiError> {
     let profile = crate::scheduling::resolve_profile(api.scope_json.as_ref());
     let weights = profile.weights();
@@ -2973,6 +2996,21 @@ async fn select_share_candidates(
         )
         .await?
         .i64("count");
+    let now = chrono::Utc::now().to_rfc3339();
+    let sticky_pair = if let Some(sticky_key) = sticky_key {
+        db.query_optional(
+                "SELECT router_id, share_id FROM market_share_sticky_routes WHERE sticky_key=?1 AND expires_at>?2 LIMIT 1",
+                vec![crate::db::val(sticky_key), crate::db::val(&now)],
+            )
+            .await?
+            .map(|row| (row.string("router_id"), row.string("share_id")))
+    } else {
+        None
+    };
+    let sticky_router_id = sticky_pair
+        .as_ref()
+        .map(|(router_id, _)| router_id.as_str());
+    let sticky_share_id = sticky_pair.as_ref().map(|(_, share_id)| share_id.as_str());
     let rows = db.query_all(
         r#"
         SELECT router_id, share_id, COALESCE(owner_email, installation_owner_email) AS owner_email,
@@ -2984,7 +3022,11 @@ async fn select_share_candidates(
                 OR (?11 = 1 AND enabled_gemini = 1))
            AND online = 1 AND share_status = 'active'
            AND COALESCE(disabled_by_market, 0) = 0
-           AND (parallel_limit = -1 OR active_requests < parallel_limit)
+           AND (
+             parallel_limit = -1
+             OR active_requests < parallel_limit
+             OR (?20 IS NOT NULL AND router_id = ?20 AND share_id = ?21)
+           )
            AND COALESCE(owner_email, installation_owner_email) IS NOT NULL
            AND (cooldown_until IS NULL OR cooldown_until < ?2)
            AND (
@@ -3030,6 +3072,7 @@ async fn select_share_candidates(
          -- a chronically-flaky share drops below healthy peers without being
          -- filtered out entirely.
          ORDER BY
+           CASE WHEN ?20 IS NOT NULL AND router_id = ?20 AND share_id = ?21 THEN 0 ELSE 1 END ASC,
            (
              (?15 * stability
               + ?16 * quota_health
@@ -3047,7 +3090,7 @@ async fn select_share_candidates(
         "#,
         vec![
             crate::db::val(app_type),
-            crate::db::val(chrono::Utc::now().to_rfc3339()),
+            crate::db::val(&now),
             crate::db::opt_uuid_val(routing_rule_id),
             crate::db::val(rule.as_ref().is_none_or(|row| row.bool("enabled"))),
             crate::db::val(rule.as_ref().map(|row| row.string("mode")).unwrap_or_else(|| "all".to_string())),
@@ -3065,6 +3108,8 @@ async fn select_share_candidates(
             crate::db::val(weights.headroom),
             crate::db::val(weights.freshness),
             crate::db::val(weights.price_bias),
+            crate::db::opt_val(sticky_router_id),
+            crate::db::opt_val(sticky_share_id),
         ],
     )
     .await?;

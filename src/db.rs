@@ -237,6 +237,22 @@ async fn additive_migrations(db: &Db) -> anyhow::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_market_share_sticky_routes_expires ON market_share_sticky_routes(expires_at);
         CREATE INDEX IF NOT EXISTS idx_market_share_sticky_routes_api_key ON market_share_sticky_routes(api_key_id);
+        CREATE TABLE IF NOT EXISTS market_response_sticky_routes (
+          response_id TEXT PRIMARY KEY,
+          sticky_key TEXT NOT NULL,
+          api_key_id TEXT,
+          user_id TEXT NOT NULL,
+          app_type TEXT NOT NULL,
+          model_id TEXT NOT NULL,
+          protocol_family TEXT NOT NULL,
+          router_id TEXT NOT NULL,
+          share_id TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_market_response_sticky_routes_expires ON market_response_sticky_routes(expires_at);
+        CREATE INDEX IF NOT EXISTS idx_market_response_sticky_routes_sticky ON market_response_sticky_routes(sticky_key);
         CREATE TABLE IF NOT EXISTS market_api_key_share_allowlist (
           api_key_id TEXT NOT NULL REFERENCES api_keys(id),
           router_id TEXT NOT NULL,
@@ -1573,6 +1589,23 @@ CREATE TABLE IF NOT EXISTS market_share_sticky_routes (
 );
 CREATE INDEX IF NOT EXISTS idx_market_share_sticky_routes_expires ON market_share_sticky_routes(expires_at);
 CREATE INDEX IF NOT EXISTS idx_market_share_sticky_routes_api_key ON market_share_sticky_routes(api_key_id);
+
+CREATE TABLE IF NOT EXISTS market_response_sticky_routes (
+  response_id TEXT PRIMARY KEY,
+  sticky_key TEXT NOT NULL,
+  api_key_id TEXT,
+  user_id TEXT NOT NULL,
+  app_type TEXT NOT NULL,
+  model_id TEXT NOT NULL,
+  protocol_family TEXT NOT NULL,
+  router_id TEXT NOT NULL,
+  share_id TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_market_response_sticky_routes_expires ON market_response_sticky_routes(expires_at);
+CREATE INDEX IF NOT EXISTS idx_market_response_sticky_routes_sticky ON market_response_sticky_routes(sticky_key);
 
 CREATE TABLE IF NOT EXISTS market_api_key_share_allowlist (
   api_key_id TEXT NOT NULL REFERENCES api_keys(id),

@@ -89,6 +89,18 @@ impl StickyRouteScope {
             app_type: app_type.to_string(),
         }
     }
+
+    fn existing(app_type: &str, sticky_key: String) -> Self {
+        Self {
+            sticky_key,
+            app_type: app_type.to_string(),
+        }
+    }
+}
+
+struct RequestSessionKey {
+    key: String,
+    previous_response_id: Option<String>,
 }
 
 pub async fn usage(
@@ -324,21 +336,23 @@ async fn handle_llm_request_with_model(
         .min(4096);
     let downstream_path = upstream_path.to_string();
     let protocol_family = protocol_family(app_type, upstream_path);
-    let sticky_app_type = share_capability(app_type).to_string();
-    let session_key = request_session_key(&meta.headers, &body_json, &body);
     let initial_model_id = pricing::match_price(db, app_type, &model)
         .await
         .ok()
         .and_then(|price| price.model_id)
         .unwrap_or_else(Uuid::nil);
-    let sticky_scope = StickyRouteScope::new(
-        api.user_id,
-        api.api_key_id,
+    let sticky_app_type = share_capability(app_type).to_string();
+    let sticky_scope = resolve_sticky_route_scope(
+        &state,
+        &meta.headers,
+        &body_json,
+        &body,
+        &api,
         &sticky_app_type,
         initial_model_id,
         protocol_family,
-        session_key,
-    );
+    )
+    .await?;
     let market_email = state.market_runtime.read().await.owner_email.clone();
     let mut candidates = select_share_candidates_with_sync_retry(
         &state,
@@ -562,6 +576,20 @@ async fn handle_llm_request_with_model(
         &upstream_share,
     )
     .await;
+    if let Some(response_id) = response_id_from_json(&response_json) {
+        record_response_sticky_route(
+            &state,
+            &response_id,
+            &sticky_scope.sticky_key,
+            api.user_id,
+            api.api_key_id,
+            &sticky_scope.app_type,
+            model_id,
+            protocol_family,
+            &upstream_share,
+        )
+        .await;
+    }
     settle_reserved_request(
         &state,
         api.user_id,
@@ -664,8 +692,13 @@ async fn handle_openai_stream(
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     let state_for_task = state.clone();
     let price_for_task = price.clone();
+    let share_for_task = share.clone();
+    let sticky_key_for_task = sticky_key.clone();
+    let app_type_for_task = app_type.clone();
+    let protocol_family_for_task = protocol_family.clone();
     let owner_email = share.owner_email.clone();
     let user_id = api.user_id;
+    let api_key_id = api.api_key_id;
     let idempotency = idempotency_key.clone();
     tokio::spawn(async move {
         let mut parser = SseUsageParser::new(usage_protocol);
@@ -709,6 +742,21 @@ async fn handle_openai_stream(
         if usage_protocol == UsageProtocol::OpenAi && !parser.saw_done() {
             let _ = tx.send(Ok(Bytes::from_static(b"data: [DONE]\n\n"))).await;
         }
+        let response_id = parser.response_id().map(ToOwned::to_owned);
+        if let Some(response_id) = response_id.as_deref() {
+            record_response_sticky_route(
+                &state_for_task,
+                response_id,
+                &sticky_key_for_task,
+                user_id,
+                api_key_id,
+                &app_type_for_task,
+                model_id,
+                &protocol_family_for_task,
+                &share_for_task,
+            )
+            .await;
+        }
         if let Some(usage) = parser.usage() {
             if let Err(err) = settle_reserved_request(
                 &state_for_task,
@@ -722,7 +770,7 @@ async fn handle_openai_stream(
                 &request_id,
                 now,
                 parser.audit_flags(),
-                None,
+                response_id.map(|id| serde_json::json!({ "responseId": id })),
             )
             .await
             {
@@ -1781,6 +1829,16 @@ fn parse_sse_json_events(text: &str) -> Vec<serde_json::Value> {
             serde_json::from_str::<serde_json::Value>(data).ok()
         })
         .collect()
+}
+
+fn response_id_from_json(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("id")
+        .or_else(|| value.pointer("/response/id"))
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn non_stream_sse_response_json(
@@ -3763,9 +3821,165 @@ async fn clear_sticky_route_for_share(
         .await;
 }
 
+async fn resolve_sticky_route_scope(
+    state: &AppState,
+    headers: &HeaderMap,
+    body_json: &serde_json::Value,
+    body: &Bytes,
+    api: &ApiKeyPrincipal,
+    app_type: &str,
+    model_id: Uuid,
+    protocol_family: &str,
+) -> Result<StickyRouteScope, ApiError> {
+    let session = request_session_key_info(headers, body_json, body);
+    if let Some(response_id) = session.previous_response_id.as_deref() {
+        if let Some(sticky_key) = lookup_response_sticky_key(
+            state,
+            response_id,
+            api.user_id,
+            api.api_key_id,
+            app_type,
+            protocol_family,
+        )
+        .await?
+        {
+            return Ok(StickyRouteScope::existing(app_type, sticky_key));
+        }
+    }
+    Ok(StickyRouteScope::new(
+        api.user_id,
+        api.api_key_id,
+        app_type,
+        model_id,
+        protocol_family,
+        session.key,
+    ))
+}
+
+async fn lookup_response_sticky_key(
+    state: &AppState,
+    response_id: &str,
+    user_id: Uuid,
+    api_key_id: Uuid,
+    app_type: &str,
+    protocol_family: &str,
+) -> Result<Option<String>, ApiError> {
+    if !state.config.market_share_sticky_enabled {
+        return Ok(None);
+    }
+    let response_id = response_id.trim();
+    if response_id.is_empty() {
+        return Ok(None);
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let _ = state
+        .db()
+        .execute(
+            "DELETE FROM market_response_sticky_routes WHERE expires_at <= ?1",
+            vec![crate::db::val(&now)],
+        )
+        .await;
+    Ok(state
+        .db()
+        .query_optional(
+            r#"
+            SELECT sticky_key
+              FROM market_response_sticky_routes
+             WHERE response_id = ?1
+               AND user_id = ?2
+               AND api_key_id = ?3
+               AND app_type = ?4
+               AND protocol_family = ?5
+               AND expires_at > ?6
+             LIMIT 1
+            "#,
+            vec![
+                crate::db::val(response_id),
+                crate::db::uuid_val(user_id),
+                crate::db::uuid_val(api_key_id),
+                crate::db::val(app_type),
+                crate::db::val(protocol_family),
+                crate::db::val(now),
+            ],
+        )
+        .await?
+        .map(|row| row.string("sticky_key")))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_response_sticky_route(
+    state: &AppState,
+    response_id: &str,
+    sticky_key: &str,
+    user_id: Uuid,
+    api_key_id: Uuid,
+    app_type: &str,
+    model_id: Uuid,
+    protocol_family: &str,
+    share: &SelectedShare,
+) {
+    if !state.config.market_share_sticky_enabled || state.config.market_share_sticky_ttl_secs == 0 {
+        return;
+    }
+    let response_id = response_id.trim();
+    if response_id.is_empty() {
+        return;
+    }
+    let now = chrono::Utc::now();
+    let expires_at =
+        (now + chrono::Duration::seconds(state.config.market_share_sticky_ttl_secs)).to_rfc3339();
+    let _ = state
+        .db()
+        .execute(
+            r#"
+            INSERT INTO market_response_sticky_routes
+              (response_id, sticky_key, api_key_id, user_id, app_type, model_id, protocol_family,
+               router_id, share_id, expires_at, created_at, updated_at)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11)
+            ON CONFLICT(response_id) DO UPDATE SET
+              sticky_key=excluded.sticky_key,
+              api_key_id=excluded.api_key_id,
+              user_id=excluded.user_id,
+              app_type=excluded.app_type,
+              model_id=excluded.model_id,
+              protocol_family=excluded.protocol_family,
+              router_id=excluded.router_id,
+              share_id=excluded.share_id,
+              expires_at=excluded.expires_at,
+              updated_at=excluded.updated_at
+            "#,
+            vec![
+                crate::db::val(response_id),
+                crate::db::val(sticky_key),
+                crate::db::uuid_val(api_key_id),
+                crate::db::uuid_val(user_id),
+                crate::db::val(app_type),
+                crate::db::uuid_val(model_id),
+                crate::db::val(protocol_family),
+                crate::db::val(&share.router_id),
+                crate::db::val(&share.share_id),
+                crate::db::val(expires_at),
+                crate::db::val(now.to_rfc3339()),
+            ],
+        )
+        .await;
+}
+
+#[cfg(test)]
 fn request_session_key(headers: &HeaderMap, body_json: &serde_json::Value, body: &Bytes) -> String {
+    request_session_key_info(headers, body_json, body).key
+}
+
+fn request_session_key_info(
+    headers: &HeaderMap,
+    body_json: &serde_json::Value,
+    body: &Bytes,
+) -> RequestSessionKey {
     if let Some(value) = header_session_value(headers) {
-        return hash_session_key("header", &value);
+        return RequestSessionKey {
+            key: hash_session_key("header", &value),
+            previous_response_id: None,
+        };
     }
     for path in [
         &["session_id"][..],
@@ -3778,16 +3992,36 @@ fn request_session_key(headers: &HeaderMap, body_json: &serde_json::Value, body:
         &["metadata", "sessionId"][..],
         &["metadata", "conversation_id"][..],
         &["metadata", "conversationId"][..],
-        &["user"][..],
     ] {
         if let Some(value) = json_string_path(body_json, path) {
-            return hash_session_key(&path.join("."), &value);
+            return RequestSessionKey {
+                key: hash_session_key(&path.join("."), &value),
+                previous_response_id: None,
+            };
         }
     }
-    if let Some(value) = message_history_session_hint(body_json) {
-        return hash_session_key("messages", &value);
+    if let Some(value) = previous_response_id(body_json) {
+        return RequestSessionKey {
+            key: hash_session_key("previous_response_id", &value),
+            previous_response_id: Some(value),
+        };
     }
-    format!("sha256:{}", hex::encode(Sha256::digest(body)))
+    if let Some(value) = json_string_path(body_json, &["user"]) {
+        return RequestSessionKey {
+            key: hash_session_key("user", &value),
+            previous_response_id: None,
+        };
+    }
+    if let Some(value) = message_history_session_hint(body_json) {
+        return RequestSessionKey {
+            key: hash_session_key("messages", &value),
+            previous_response_id: None,
+        };
+    }
+    RequestSessionKey {
+        key: format!("sha256:{}", hex::encode(Sha256::digest(body))),
+        previous_response_id: None,
+    }
 }
 
 fn header_session_value(headers: &HeaderMap) -> Option<String> {
@@ -3807,6 +4041,13 @@ fn header_session_value(headers: &HeaderMap) -> Option<String> {
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
     })
+}
+
+fn previous_response_id(body_json: &serde_json::Value) -> Option<String> {
+    json_string_path(body_json, &["previous_response_id"])
+        .or_else(|| json_string_path(body_json, &["previousResponseId"]))
+        .or_else(|| json_string_path(body_json, &["metadata", "previous_response_id"]))
+        .or_else(|| json_string_path(body_json, &["metadata", "previousResponseId"]))
 }
 
 fn json_string_path(value: &serde_json::Value, path: &[&str]) -> Option<String> {
@@ -3854,12 +4095,11 @@ fn sticky_route_key(
     user_id: Uuid,
     api_key_id: Uuid,
     app_type: &str,
-    model_id: Uuid,
+    _model_id: Uuid,
     protocol_family: &str,
     session_key: &str,
 ) -> String {
-    let raw =
-        format!("{user_id}:{api_key_id}:{app_type}:{model_id}:{protocol_family}:{session_key}");
+    let raw = format!("{user_id}:{api_key_id}:{app_type}:{protocol_family}:{session_key}");
     format!("sha256:{}", hex::encode(Sha256::digest(raw.as_bytes())))
 }
 
@@ -4441,6 +4681,29 @@ mod tests {
     }
 
     #[test]
+    fn request_session_key_uses_previous_response_id_before_body_hash() {
+        let headers = HeaderMap::new();
+        let session_a = request_session_key(
+            &headers,
+            &json!({"previous_response_id": "resp_abc", "input": "one"}),
+            &Bytes::from_static(br#"{"previous_response_id":"resp_abc","input":"one"}"#),
+        );
+        let session_b = request_session_key(
+            &headers,
+            &json!({"previous_response_id": "resp_abc", "input": "two"}),
+            &Bytes::from_static(br#"{"previous_response_id":"resp_abc","input":"two"}"#),
+        );
+        let session_c = request_session_key(
+            &headers,
+            &json!({"previous_response_id": "resp_other", "input": "two"}),
+            &Bytes::from_static(br#"{"previous_response_id":"resp_other","input":"two"}"#),
+        );
+
+        assert_eq!(session_a, session_b);
+        assert_ne!(session_a, session_c);
+    }
+
+    #[test]
     fn sticky_route_key_includes_session_key() {
         let user_id = Uuid::nil();
         let api_key_id = Uuid::nil();
@@ -4463,6 +4726,30 @@ mod tests {
         );
 
         assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn sticky_route_key_is_model_independent() {
+        let user_id = Uuid::nil();
+        let api_key_id = Uuid::nil();
+        let key_a = sticky_route_key(
+            user_id,
+            api_key_id,
+            "codex",
+            Uuid::nil(),
+            "responses",
+            "session-a",
+        );
+        let key_b = sticky_route_key(
+            user_id,
+            api_key_id,
+            "codex",
+            Uuid::new_v4(),
+            "responses",
+            "session-a",
+        );
+
+        assert_eq!(key_a, key_b);
     }
 
     #[test]

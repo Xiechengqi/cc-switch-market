@@ -510,6 +510,13 @@ pub async fn delete_api_key_endpoint(
             vec![crate::db::uuid_val(id)],
         )
         .await?;
+    state
+        .db()
+        .execute(
+            "DELETE FROM market_response_sticky_routes WHERE api_key_id=?1",
+            vec![crate::db::uuid_val(id)],
+        )
+        .await?;
     Ok(Json(ApiKeyDeleteResponse { deleted: true, id }))
 }
 
@@ -665,6 +672,11 @@ pub async fn set_api_key_share_allowlist_endpoint(
     }
     tx.execute(
         "DELETE FROM market_share_sticky_routes WHERE api_key_id=?1",
+        vec![crate::db::uuid_val(id)],
+    )
+    .await?;
+    tx.execute(
+        "DELETE FROM market_response_sticky_routes WHERE api_key_id=?1",
         vec![crate::db::uuid_val(id)],
     )
     .await?;

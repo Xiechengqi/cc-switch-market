@@ -92,6 +92,7 @@ pub struct SseUsageParser {
     buffer: String,
     utf8_remainder: Vec<u8>,
     usage: Option<UsageTokens>,
+    response_id: Option<String>,
     complete_usage_seen: bool,
     saw_done: bool,
     parse_errors: u64,
@@ -104,6 +105,7 @@ impl SseUsageParser {
             buffer: String::new(),
             utf8_remainder: Vec::new(),
             usage: None,
+            response_id: None,
             complete_usage_seen: false,
             saw_done: false,
             parse_errors: 0,
@@ -138,6 +140,10 @@ impl SseUsageParser {
 
     pub fn saw_done(&self) -> bool {
         self.saw_done
+    }
+
+    pub fn response_id(&self) -> Option<&str> {
+        self.response_id.as_deref()
     }
 
     pub fn audit_flags(&self) -> Value {
@@ -176,6 +182,11 @@ impl SseUsageParser {
             self.parse_errors += 1;
             return;
         };
+        if self.protocol == UsageProtocol::Codex {
+            if let Some(response_id) = codex_response_id_event(&value) {
+                self.response_id = Some(response_id.to_string());
+            }
+        }
         let usage = match self.protocol {
             UsageProtocol::OpenAi => openai_usage(&value),
             UsageProtocol::Anthropic => anthropic_stream_usage_event(&value),
@@ -203,6 +214,15 @@ impl SseUsageParser {
             });
         }
     }
+}
+
+fn codex_response_id_event(value: &Value) -> Option<&str> {
+    value
+        .pointer("/response/id")
+        .or_else(|| value.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
 }
 
 fn openai_usage(value: &Value) -> Option<UsageParts> {
@@ -551,6 +571,24 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":100}}}
         assert_eq!(usage.input_tokens, 4);
         assert_eq!(usage.output_tokens, 220);
         assert_eq!(usage.source, "market_gemini_stream_usage");
+    }
+
+    #[test]
+    fn captures_codex_stream_response_id() {
+        let mut parser = SseUsageParser::new(UsageProtocol::Codex);
+        parser.feed(
+            br#"data: {"type":"response.created","response":{"id":"resp_123","usage":null}}
+
+data: {"type":"response.completed","response":{"id":"resp_123","usage":{"input_tokens":3,"output_tokens":5}}}
+
+"#,
+        );
+        parser.finish();
+
+        let usage = parser.usage().expect("usage");
+        assert_eq!(usage.input_tokens, 3);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(parser.response_id(), Some("resp_123"));
     }
 
     #[test]

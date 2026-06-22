@@ -64,6 +64,7 @@ pub struct ShareSessionLoad {
 #[derive(Clone)]
 struct StickyRouteScope {
     sticky_key: String,
+    fallback_sticky_key: Option<String>,
     app_type: String,
 }
 
@@ -74,7 +75,7 @@ impl StickyRouteScope {
         app_type: &str,
         model_id: Uuid,
         protocol_family: &str,
-        session_key: String,
+        session_key: RequestSessionKey,
     ) -> Self {
         let sticky_key = sticky_route_key(
             user_id,
@@ -82,24 +83,41 @@ impl StickyRouteScope {
             app_type,
             model_id,
             protocol_family,
-            &session_key,
+            &session_key.primary_key,
         );
+        let fallback_sticky_key = session_key.fallback_key.as_deref().map(|fallback_key| {
+            sticky_route_key(
+                user_id,
+                api_key_id,
+                app_type,
+                model_id,
+                protocol_family,
+                fallback_key,
+            )
+        });
         Self {
             sticky_key,
+            fallback_sticky_key,
             app_type: app_type.to_string(),
         }
     }
 
-    fn existing(app_type: &str, sticky_key: String) -> Self {
-        Self {
-            sticky_key,
-            app_type: app_type.to_string(),
+    fn sticky_keys(&self) -> Vec<&str> {
+        let mut keys = vec![self.sticky_key.as_str()];
+        if let Some(fallback) = self
+            .fallback_sticky_key
+            .as_deref()
+            .filter(|fallback| *fallback != self.sticky_key.as_str())
+        {
+            keys.push(fallback);
         }
+        keys
     }
 }
 
 struct RequestSessionKey {
-    key: String,
+    primary_key: String,
+    fallback_key: Option<String>,
     previous_response_id: Option<String>,
 }
 
@@ -353,6 +371,7 @@ async fn handle_llm_request_with_model(
         protocol_family,
     )
     .await?;
+    let sticky_keys = sticky_scope.sticky_keys();
     let market_email = state.market_runtime.read().await.owner_email.clone();
     let mut candidates = select_share_candidates_with_sync_retry(
         &state,
@@ -361,7 +380,7 @@ async fn handle_llm_request_with_model(
         app_type,
         &model,
         100,
-        Some(&sticky_scope.sticky_key),
+        &sticky_keys,
     )
     .await?;
     let use_responses_upstream = candidates
@@ -480,7 +499,8 @@ async fn handle_llm_request_with_model(
             upstream_path,
             now,
             usage_protocol,
-            sticky_scope.sticky_key,
+            sticky_scope.sticky_key.clone(),
+            sticky_scope.fallback_sticky_key.clone(),
             sticky_scope.app_type.clone(),
             protocol_family.to_string(),
             model_id,
@@ -497,6 +517,7 @@ async fn handle_llm_request_with_model(
         &request_id,
         upstream_path,
         Some(&sticky_scope.sticky_key),
+        sticky_scope.fallback_sticky_key.as_deref(),
     )
     .await
     {
@@ -565,9 +586,10 @@ async fn handle_llm_request_with_model(
             )
         }
     };
-    refresh_sticky_route(
+    refresh_sticky_routes(
         &state,
         Some(&sticky_scope.sticky_key),
+        sticky_scope.fallback_sticky_key.as_deref(),
         api.user_id,
         api.api_key_id,
         &sticky_scope.app_type,
@@ -625,6 +647,7 @@ async fn handle_openai_stream(
     now: chrono::DateTime<chrono::Utc>,
     usage_protocol: UsageProtocol,
     sticky_key: String,
+    fallback_sticky_key: Option<String>,
     app_type: String,
     protocol_family: String,
     model_id: Uuid,
@@ -646,6 +669,7 @@ async fn handle_openai_stream(
         &request_id,
         upstream_path,
         Some(&sticky_key),
+        fallback_sticky_key.as_deref(),
         api.user_id,
         api.api_key_id,
         &app_type,
@@ -1700,6 +1724,7 @@ async fn forward_non_stream_with_retries(
     request_id: &str,
     upstream_path: &str,
     sticky_key: Option<&str>,
+    fallback_sticky_key: Option<&str>,
 ) -> Result<(UpstreamNonStreamResponse, SelectedShare), ApiError> {
     let mut last_err = None;
     for (idx, share) in candidates.iter().enumerate() {
@@ -1740,7 +1765,7 @@ async fn forward_non_stream_with_retries(
                     started,
                 )
                 .await;
-                clear_sticky_route_for_share(state, sticky_key, share).await;
+                clear_sticky_routes_for_share(state, sticky_key, fallback_sticky_key, share).await;
                 maybe_block_model_share(state, model_id, share, kind, &message).await;
                 maybe_report_router_feedback(state, share, kind, &message).await;
                 let retryable = is_retryable_failure(kind);
@@ -2308,6 +2333,7 @@ async fn forward_stream_with_retries(
     request_id: &str,
     upstream_path: &str,
     sticky_key: Option<&str>,
+    fallback_sticky_key: Option<&str>,
     user_id: Uuid,
     api_key_id: Uuid,
     app_type: &str,
@@ -2348,9 +2374,10 @@ async fn forward_stream_with_retries(
                     started,
                 )
                 .await;
-                refresh_sticky_route(
+                refresh_sticky_routes(
                     state,
                     sticky_key,
+                    fallback_sticky_key,
                     user_id,
                     api_key_id,
                     app_type,
@@ -2377,7 +2404,7 @@ async fn forward_stream_with_retries(
                     started,
                 )
                 .await;
-                clear_sticky_route_for_share(state, sticky_key, share).await;
+                clear_sticky_routes_for_share(state, sticky_key, fallback_sticky_key, share).await;
                 maybe_block_model_share(state, model_id, share, kind, &message).await;
                 maybe_report_router_feedback(state, share, kind, &message).await;
                 let retryable = is_retryable_failure(kind);
@@ -2947,7 +2974,7 @@ async fn select_share_candidates_with_sync_retry(
     app_type: &str,
     model: &str,
     limit: i64,
-    sticky_key: Option<&str>,
+    sticky_keys: &[&str],
 ) -> Result<Vec<SelectedShare>, ApiError> {
     match select_share_candidates(
         state.db(),
@@ -2956,7 +2983,7 @@ async fn select_share_candidates_with_sync_retry(
         app_type,
         model,
         limit,
-        sticky_key,
+        sticky_keys,
     )
     .await
     {
@@ -2983,7 +3010,7 @@ async fn select_share_candidates_with_sync_retry(
                 app_type,
                 model,
                 limit,
-                sticky_key,
+                sticky_keys,
             )
             .await
         }
@@ -3011,7 +3038,7 @@ async fn select_share_candidates(
     app_type: &str,
     model: &str,
     limit: i64,
-    sticky_key: Option<&str>,
+    sticky_keys: &[&str],
 ) -> Result<Vec<SelectedShare>, ApiError> {
     let profile = crate::scheduling::resolve_profile(api.scope_json.as_ref());
     let weights = profile.weights();
@@ -3055,16 +3082,7 @@ async fn select_share_candidates(
         .await?
         .i64("count");
     let now = chrono::Utc::now().to_rfc3339();
-    let sticky_pair = if let Some(sticky_key) = sticky_key {
-        db.query_optional(
-                "SELECT router_id, share_id FROM market_share_sticky_routes WHERE sticky_key=?1 AND expires_at>?2 LIMIT 1",
-                vec![crate::db::val(sticky_key), crate::db::val(&now)],
-            )
-            .await?
-            .map(|row| (row.string("router_id"), row.string("share_id")))
-    } else {
-        None
-    };
+    let sticky_pair = lookup_sticky_route_pair_by_keys(db, sticky_keys, &now).await?;
     let sticky_router_id = sticky_pair
         .as_ref()
         .map(|(router_id, _)| router_id.as_str());
@@ -3657,14 +3675,7 @@ async fn order_share_candidates(
             vec![crate::db::val(&now)],
         )
         .await;
-    let sticky = state
-        .db()
-        .query_optional(
-            "SELECT router_id, share_id FROM market_share_sticky_routes WHERE sticky_key=?1 AND expires_at>?2 LIMIT 1",
-            vec![crate::db::val(&sticky_scope.sticky_key), crate::db::val(&now)],
-        )
-        .await?;
-    let sticky_pair = sticky.map(|row| (row.string("router_id"), row.string("share_id")));
+    let sticky_pair = lookup_sticky_route_pair(state, sticky_scope, &now).await?;
     let session_loads = share_session_loads_for_app(state, &sticky_scope.app_type, &now).await?;
     candidates.sort_by(|a, b| {
         let a_sticky = sticky_pair
@@ -3693,6 +3704,39 @@ async fn order_share_candidates(
             .then_with(|| a.share_id.cmp(&b.share_id))
     });
     Ok(candidates)
+}
+
+async fn lookup_sticky_route_pair(
+    state: &AppState,
+    sticky_scope: &StickyRouteScope,
+    now: &str,
+) -> Result<Option<(String, String)>, ApiError> {
+    let sticky_keys = sticky_scope.sticky_keys();
+    lookup_sticky_route_pair_by_keys(state.db(), &sticky_keys, now).await
+}
+
+async fn lookup_sticky_route_pair_by_keys(
+    db: &crate::db::Db,
+    sticky_keys: &[&str],
+    now: &str,
+) -> Result<Option<(String, String)>, ApiError> {
+    for sticky_key in sticky_keys {
+        if let Some(row) = db
+            .query_optional(
+                r#"
+                SELECT router_id, share_id
+                  FROM market_share_sticky_routes
+                 WHERE sticky_key=?1 AND expires_at>?2
+                 LIMIT 1
+                "#,
+                vec![crate::db::val(sticky_key), crate::db::val(now)],
+            )
+            .await?
+        {
+            return Ok(Some((row.string("router_id"), row.string("share_id"))));
+        }
+    }
+    Ok(None)
 }
 
 async fn share_session_loads_for_app(
@@ -3750,6 +3794,45 @@ fn share_weight(share: &SelectedShare) -> f64 {
     priority * online * capacity
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn refresh_sticky_routes(
+    state: &AppState,
+    sticky_key: Option<&str>,
+    fallback_sticky_key: Option<&str>,
+    user_id: Uuid,
+    api_key_id: Uuid,
+    app_type: &str,
+    model_id: Uuid,
+    protocol_family: &str,
+    share: &SelectedShare,
+) {
+    refresh_sticky_route(
+        state,
+        sticky_key,
+        user_id,
+        api_key_id,
+        app_type,
+        model_id,
+        protocol_family,
+        share,
+    )
+    .await;
+    if fallback_sticky_key.is_some() && fallback_sticky_key != sticky_key {
+        refresh_sticky_route(
+            state,
+            fallback_sticky_key,
+            user_id,
+            api_key_id,
+            app_type,
+            model_id,
+            protocol_family,
+            share,
+        )
+        .await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn refresh_sticky_route(
     state: &AppState,
     sticky_key: Option<&str>,
@@ -3800,6 +3883,18 @@ async fn refresh_sticky_route(
         .await;
 }
 
+async fn clear_sticky_routes_for_share(
+    state: &AppState,
+    sticky_key: Option<&str>,
+    fallback_sticky_key: Option<&str>,
+    share: &SelectedShare,
+) {
+    clear_sticky_route_for_share(state, sticky_key, share).await;
+    if fallback_sticky_key.is_some() && fallback_sticky_key != sticky_key {
+        clear_sticky_route_for_share(state, fallback_sticky_key, share).await;
+    }
+}
+
 async fn clear_sticky_route_for_share(
     state: &AppState,
     sticky_key: Option<&str>,
@@ -3832,7 +3927,16 @@ async fn resolve_sticky_route_scope(
     protocol_family: &str,
 ) -> Result<StickyRouteScope, ApiError> {
     let session = request_session_key_info(headers, body_json, body);
-    if let Some(response_id) = session.previous_response_id.as_deref() {
+    let previous_response_id = session.previous_response_id.clone();
+    let mut scope = StickyRouteScope::new(
+        api.user_id,
+        api.api_key_id,
+        app_type,
+        model_id,
+        protocol_family,
+        session,
+    );
+    if let Some(response_id) = previous_response_id.as_deref() {
         if let Some(sticky_key) = lookup_response_sticky_key(
             state,
             response_id,
@@ -3843,17 +3947,12 @@ async fn resolve_sticky_route_scope(
         )
         .await?
         {
-            return Ok(StickyRouteScope::existing(app_type, sticky_key));
+            if sticky_key != scope.sticky_key {
+                scope.fallback_sticky_key = Some(sticky_key);
+            }
         }
     }
-    Ok(StickyRouteScope::new(
-        api.user_id,
-        api.api_key_id,
-        app_type,
-        model_id,
-        protocol_family,
-        session.key,
-    ))
+    Ok(scope)
 }
 
 async fn lookup_response_sticky_key(
@@ -3967,7 +4066,7 @@ async fn record_response_sticky_route(
 
 #[cfg(test)]
 fn request_session_key(headers: &HeaderMap, body_json: &serde_json::Value, body: &Bytes) -> String {
-    request_session_key_info(headers, body_json, body).key
+    request_session_key_info(headers, body_json, body).primary_key
 }
 
 fn request_session_key_info(
@@ -3977,7 +4076,8 @@ fn request_session_key_info(
 ) -> RequestSessionKey {
     if let Some(value) = header_session_value(headers) {
         return RequestSessionKey {
-            key: hash_session_key("header", &value),
+            primary_key: hash_session_key("header", &value),
+            fallback_key: None,
             previous_response_id: None,
         };
     }
@@ -3988,38 +4088,55 @@ fn request_session_key_info(
         &["conversationId"][..],
         &["thread_id"][..],
         &["threadId"][..],
+        &["prompt_cache_key"][..],
+        &["promptCacheKey"][..],
         &["metadata", "session_id"][..],
         &["metadata", "sessionId"][..],
         &["metadata", "conversation_id"][..],
         &["metadata", "conversationId"][..],
+        &["metadata", "user_id"][..],
+        &["metadata", "userId"][..],
     ] {
         if let Some(value) = json_string_path(body_json, path) {
             return RequestSessionKey {
-                key: hash_session_key(&path.join("."), &value),
+                primary_key: hash_session_key(&path.join("."), &value),
+                fallback_key: None,
                 previous_response_id: None,
             };
         }
     }
-    if let Some(value) = previous_response_id(body_json) {
+    let response_id = previous_response_id(body_json);
+    if let Some(value) = json_string_path(body_json, &["user"]) {
         return RequestSessionKey {
-            key: hash_session_key("previous_response_id", &value),
+            primary_key: hash_session_key("user", &value),
+            fallback_key: None,
+            previous_response_id: response_id,
+        };
+    }
+    if let Some((primary, fallback)) = message_history_session_hint(body_json) {
+        return RequestSessionKey {
+            primary_key: hash_session_key("messages", &primary),
+            fallback_key: fallback.map(|value| hash_session_key("messages", &value)),
+            previous_response_id: response_id,
+        };
+    }
+    if let Some((primary, fallback)) = responses_input_history_session_hint(body_json) {
+        return RequestSessionKey {
+            primary_key: hash_session_key("input_history", &primary),
+            fallback_key: fallback.map(|value| hash_session_key("input_history", &value)),
+            previous_response_id: response_id,
+        };
+    }
+    if let Some(value) = response_id {
+        return RequestSessionKey {
+            primary_key: hash_session_key("previous_response_id", &value),
+            fallback_key: None,
             previous_response_id: Some(value),
         };
     }
-    if let Some(value) = json_string_path(body_json, &["user"]) {
-        return RequestSessionKey {
-            key: hash_session_key("user", &value),
-            previous_response_id: None,
-        };
-    }
-    if let Some(value) = message_history_session_hint(body_json) {
-        return RequestSessionKey {
-            key: hash_session_key("messages", &value),
-            previous_response_id: None,
-        };
-    }
     RequestSessionKey {
-        key: format!("sha256:{}", hex::encode(Sha256::digest(body))),
+        primary_key: format!("sha256:{}", hex::encode(Sha256::digest(body))),
+        fallback_key: None,
         previous_response_id: None,
     }
 }
@@ -4028,8 +4145,12 @@ fn header_session_value(headers: &HeaderMap) -> Option<String> {
     [
         "x-cc-session-id",
         "x-session-id",
+        "session-id",
+        "session_id",
         "x-conversation-id",
         "x-thread-id",
+        "x-amp-thread-id",
+        "x-client-request-id",
         "openai-conversation-id",
     ]
     .iter()
@@ -4062,28 +4183,153 @@ fn json_string_path(value: &serde_json::Value, path: &[&str]) -> Option<String> 
         .map(ToOwned::to_owned)
 }
 
-fn message_history_session_hint(body_json: &serde_json::Value) -> Option<String> {
+fn message_history_session_hint(body_json: &serde_json::Value) -> Option<(String, Option<String>)> {
     let messages = body_json.get("messages")?.as_array()?;
     if messages.is_empty() {
         return None;
     }
-    let hint = messages
-        .iter()
-        .take(2)
-        .map(|message| {
-            let role = message
-                .get("role")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default();
-            let content = message
-                .get("content")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            format!("{role}:{content}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    (!hint.trim().is_empty()).then_some(hint)
+    let mut system_prompt = String::new();
+    let mut first_user = String::new();
+    let mut first_assistant = String::new();
+
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let Some(content) = responses_input_content_text(
+            message.get("content").unwrap_or(&serde_json::Value::Null),
+        ) else {
+            continue;
+        };
+        match role.as_str() {
+            "developer" | "system" if system_prompt.is_empty() => system_prompt = content,
+            "user" if first_user.is_empty() => first_user = content,
+            "assistant" if first_assistant.is_empty() => first_assistant = content,
+            _ => {}
+        }
+        if !system_prompt.is_empty() && !first_user.is_empty() && !first_assistant.is_empty() {
+            break;
+        }
+    }
+    session_hint_from_parts(&system_prompt, &first_user, &first_assistant)
+}
+
+fn responses_input_history_session_hint(
+    body_json: &serde_json::Value,
+) -> Option<(String, Option<String>)> {
+    let mut system_prompt = body_json
+        .get("instructions")
+        .and_then(|value| value.as_str())
+        .map(trim_session_text)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    let input_value = body_json.get("input")?;
+    if let Some(input) = input_value.as_str() {
+        return session_hint_from_parts(&system_prompt, input, "");
+    }
+    let input = input_value.as_array()?;
+    let mut first_user = String::new();
+    let mut first_assistant = String::new();
+
+    for item in input {
+        let Some((role, content)) = responses_input_message_hint(item) else {
+            continue;
+        };
+        match role.as_str() {
+            "developer" | "system" if system_prompt.is_empty() => system_prompt = content,
+            "user" if first_user.is_empty() => first_user = content,
+            "assistant" if first_assistant.is_empty() => first_assistant = content,
+            _ => {}
+        }
+        if !system_prompt.is_empty() && !first_user.is_empty() && !first_assistant.is_empty() {
+            break;
+        }
+    }
+
+    session_hint_from_parts(&system_prompt, &first_user, &first_assistant)
+}
+
+fn session_hint_from_parts(
+    system_prompt: &str,
+    first_user: &str,
+    first_assistant: &str,
+) -> Option<(String, Option<String>)> {
+    if system_prompt.trim().is_empty() && first_user.trim().is_empty() {
+        return None;
+    }
+    let short = format!(
+        "sys:{}\nusr:{}",
+        trim_session_text(system_prompt),
+        trim_session_text(first_user)
+    );
+    if first_assistant.trim().is_empty() {
+        return Some((short, None));
+    }
+    let full = format!("{short}\nast:{}", trim_session_text(first_assistant));
+    Some((full, Some(short)))
+}
+
+fn responses_input_message_hint(item: &serde_json::Value) -> Option<(String, String)> {
+    let item_type = item
+        .get("type")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .unwrap_or_default();
+    if item_type == "reasoning" || (!item_type.is_empty() && item_type != "message") {
+        return None;
+    }
+    let role = item
+        .get("role")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown")
+        .to_ascii_lowercase();
+    if role == "unknown" && item_type.is_empty() {
+        return None;
+    }
+    let content = responses_input_content_text(item.get("content").unwrap_or(item))?;
+    Some((role, content))
+}
+
+fn trim_session_text(value: &str) -> String {
+    value.trim().chars().take(4096).collect()
+}
+
+fn responses_input_content_text(content: &serde_json::Value) -> Option<String> {
+    match content {
+        serde_json::Value::String(value) => {
+            let value = value.trim();
+            if value.is_empty() {
+                None
+            } else {
+                Some(trim_session_text(value))
+            }
+        }
+        serde_json::Value::Array(items) => {
+            let text = items
+                .iter()
+                .filter_map(responses_input_content_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.trim().is_empty()).then_some(trim_session_text(&text))
+        }
+        serde_json::Value::Object(object) => {
+            for key in ["text", "input_text", "output_text"] {
+                if let Some(value) = object.get(key).and_then(|value| value.as_str()) {
+                    let value = value.trim();
+                    if !value.is_empty() {
+                        return Some(trim_session_text(value));
+                    }
+                }
+            }
+            object.get("content").and_then(responses_input_content_text)
+        }
+        _ => None,
+    }
 }
 
 fn hash_session_key(source: &str, value: &str) -> String {
@@ -4681,26 +4927,144 @@ mod tests {
     }
 
     #[test]
-    fn request_session_key_uses_previous_response_id_before_body_hash() {
+    fn request_session_key_tracks_previous_response_id_without_overriding_content() {
         let headers = HeaderMap::new();
-        let session_a = request_session_key(
+        let session_a = request_session_key_info(
             &headers,
             &json!({"previous_response_id": "resp_abc", "input": "one"}),
             &Bytes::from_static(br#"{"previous_response_id":"resp_abc","input":"one"}"#),
         );
-        let session_b = request_session_key(
+        let session_b = request_session_key_info(
             &headers,
             &json!({"previous_response_id": "resp_abc", "input": "two"}),
             &Bytes::from_static(br#"{"previous_response_id":"resp_abc","input":"two"}"#),
         );
-        let session_c = request_session_key(
+        let session_c = request_session_key_info(
             &headers,
             &json!({"previous_response_id": "resp_other", "input": "two"}),
             &Bytes::from_static(br#"{"previous_response_id":"resp_other","input":"two"}"#),
         );
 
+        assert_eq!(session_a.previous_response_id.as_deref(), Some("resp_abc"));
+        assert_eq!(session_b.previous_response_id.as_deref(), Some("resp_abc"));
+        assert_eq!(
+            session_c.previous_response_id.as_deref(),
+            Some("resp_other")
+        );
+        assert_ne!(session_a.primary_key, session_b.primary_key);
+        assert_eq!(session_b.primary_key, session_c.primary_key);
+    }
+
+    #[test]
+    fn request_session_key_accepts_codex_session_headers() {
+        let mut codex_headers = HeaderMap::new();
+        codex_headers.insert("session_id", "codex-session".parse().unwrap());
+        let mut generic_headers = HeaderMap::new();
+        generic_headers.insert("x-session-id", "codex-session".parse().unwrap());
+        let body_json = json!({"input": "ignored"});
+        let body = Bytes::from_static(br#"{"input":"ignored"}"#);
+
+        assert_eq!(
+            request_session_key(&codex_headers, &body_json, &body),
+            request_session_key(&generic_headers, &body_json, &body)
+        );
+    }
+
+    #[test]
+    fn request_session_key_uses_prompt_cache_key_before_content() {
+        let headers = HeaderMap::new();
+        let session_a = request_session_key(
+            &headers,
+            &json!({"prompt_cache_key": "stable-cache", "input": "first"}),
+            &Bytes::from_static(br#"{"prompt_cache_key":"stable-cache","input":"first"}"#),
+        );
+        let session_b = request_session_key(
+            &headers,
+            &json!({"prompt_cache_key": "stable-cache", "input": "second"}),
+            &Bytes::from_static(br#"{"prompt_cache_key":"stable-cache","input":"second"}"#),
+        );
+
+        assert_eq!(session_a, session_b);
+    }
+
+    #[test]
+    fn request_session_key_uses_responses_input_history_hint() {
+        let headers = HeaderMap::new();
+        let session_a = request_session_key(
+            &headers,
+            &json!({
+                "model": "gpt-5.5",
+                "input": [
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "first question"}]},
+                    {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "first answer"}]},
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "second question"}]},
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "current turn A"}]}
+                ]
+            }),
+            &Bytes::from_static(br#"{"input":"different-a"}"#),
+        );
+        let session_b = request_session_key(
+            &headers,
+            &json!({
+                "model": "gpt-5.5",
+                "input": [
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "first question"}]},
+                    {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "first answer"}]},
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "second question"}]},
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "current turn B"}]}
+                ]
+            }),
+            &Bytes::from_static(br#"{"input":"different-b"}"#),
+        );
+        let session_c = request_session_key(
+            &headers,
+            &json!({
+                "model": "gpt-5.5",
+                "input": [
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "another session"}]},
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "second question"}]}
+                ]
+            }),
+            &Bytes::from_static(br#"{"input":"different-c"}"#),
+        );
+
         assert_eq!(session_a, session_b);
         assert_ne!(session_a, session_c);
+    }
+
+    #[test]
+    fn request_session_key_uses_responses_fallback_to_inherit_first_turn() {
+        let headers = HeaderMap::new();
+        let first_turn = request_session_key_info(
+            &headers,
+            &json!({
+                "instructions": "be concise",
+                "input": [
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "same opening"}]}
+                ]
+            }),
+            &Bytes::from_static(br#"{"input":"first"}"#),
+        );
+        let followup_turn = request_session_key_info(
+            &headers,
+            &json!({
+                "instructions": "be concise",
+                "input": [
+                    {"type": "reasoning", "summary": []},
+                    {"type": "function_call", "name": "ignored"},
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "same opening"}]},
+                    {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "first assistant response"}]},
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "next question"}]}
+                ]
+            }),
+            &Bytes::from_static(br#"{"input":"followup"}"#),
+        );
+
+        assert_ne!(first_turn.primary_key, followup_turn.primary_key);
+        assert_eq!(
+            followup_turn.fallback_key.as_deref(),
+            Some(first_turn.primary_key.as_str())
+        );
     }
 
     #[test]

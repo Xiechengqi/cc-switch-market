@@ -30,6 +30,21 @@ enum UpstreamNonStreamResponse {
     SseText(String),
 }
 
+#[derive(Clone, Debug, Default)]
+struct UpstreamModelRoute {
+    requested_model: Option<String>,
+    actual_model: Option<String>,
+    actual_model_source: Option<String>,
+}
+
+impl UpstreamModelRoute {
+    fn is_empty(&self) -> bool {
+        self.requested_model.is_none()
+            && self.actual_model.is_none()
+            && self.actual_model_source.is_none()
+    }
+}
+
 struct NonStreamSseFallback {
     usage: Option<UsageTokens>,
     response_json: serde_json::Value,
@@ -1611,6 +1626,23 @@ fn is_hop_by_hop_router_market_proxy_header(lower: &str) -> bool {
     )
 }
 
+fn model_route_from_headers(headers: &HeaderMap) -> UpstreamModelRoute {
+    fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
+    UpstreamModelRoute {
+        requested_model: header_string(headers, "x-cc-switch-requested-model"),
+        actual_model: header_string(headers, "x-cc-switch-actual-model"),
+        actual_model_source: header_string(headers, "x-cc-switch-actual-model-source"),
+    }
+}
+
 async fn forward_to_router_market_proxy(
     state: &AppState,
     headers: &HeaderMap,
@@ -1618,7 +1650,7 @@ async fn forward_to_router_market_proxy(
     share: &SelectedShare,
     request_id: &str,
     upstream_path: &str,
-) -> Result<UpstreamNonStreamResponse, ApiError> {
+) -> Result<(UpstreamNonStreamResponse, UpstreamModelRoute), ApiError> {
     let access_token = crate::router_account::access_token(&state.config)
         .await
         .map_err(|e| ApiError::service_unavailable(format!("router login required: {e}")))?;
@@ -1638,6 +1670,7 @@ async fn forward_to_router_market_proxy(
         ApiError::service_unavailable(format!("router market proxy failed: {err}"))
     })?;
     let status = response.status();
+    let model_route = model_route_from_headers(response.headers());
     let is_event_stream = response
         .headers()
         .get(header::CONTENT_TYPE)
@@ -1658,11 +1691,11 @@ async fn forward_to_router_market_proxy(
     }
     record_share_success(state, share).await;
     if is_event_stream || looks_like_sse(&text) {
-        return Ok(UpstreamNonStreamResponse::SseText(text));
+        return Ok((UpstreamNonStreamResponse::SseText(text), model_route));
     }
     let value =
         serde_json::from_str::<serde_json::Value>(&text).unwrap_or_else(|_| json!({ "raw": text }));
-    Ok(UpstreamNonStreamResponse::Json(value))
+    Ok((UpstreamNonStreamResponse::Json(value), model_route))
 }
 
 fn router_market_proxy_error(status: StatusCode, message: String) -> ApiError {
@@ -1681,7 +1714,7 @@ async fn forward_to_router_market_proxy_stream(
     share: &SelectedShare,
     request_id: &str,
     upstream_path: &str,
-) -> Result<reqwest::Response, ApiError> {
+) -> Result<(reqwest::Response, UpstreamModelRoute), ApiError> {
     let access_token = crate::router_account::access_token(&state.config)
         .await
         .map_err(|e| ApiError::service_unavailable(format!("router login required: {e}")))?;
@@ -1714,8 +1747,9 @@ async fn forward_to_router_market_proxy_stream(
         }
         return Err(router_market_proxy_error(status, error_message));
     }
+    let model_route = model_route_from_headers(response.headers());
     record_share_success(state, share).await;
-    Ok(response)
+    Ok((response, model_route))
 }
 
 async fn forward_non_stream_with_retries(
@@ -1737,7 +1771,8 @@ async fn forward_non_stream_with_retries(
         match forward_to_router_market_proxy(state, headers, body, share, request_id, upstream_path)
             .await
         {
-            Ok(value) => {
+            Ok((value, model_route)) => {
+                update_charge_model_route(state, charge_id, &model_route).await?;
                 record_request_attempt(
                     state,
                     request_id,
@@ -2364,7 +2399,8 @@ async fn forward_stream_with_retries(
         )
         .await
         {
-            Ok(response) => {
+            Ok((response, model_route)) => {
+                update_charge_model_route(state, charge_id, &model_route).await?;
                 record_request_attempt(
                     state,
                     request_id,
@@ -2438,6 +2474,35 @@ async fn update_charge_route(
             crate::db::opt_uuid_val(share.routing_rule_id),
         ],
     ).await?;
+    Ok(())
+}
+
+async fn update_charge_model_route(
+    state: &AppState,
+    charge_id: Uuid,
+    route: &UpstreamModelRoute,
+) -> Result<(), ApiError> {
+    if route.is_empty() {
+        return Ok(());
+    }
+    state
+        .db()
+        .execute(
+            r#"
+            UPDATE request_charges
+               SET requested_model = COALESCE(?2, requested_model),
+                   actual_model = COALESCE(?3, actual_model),
+                   actual_model_source = COALESCE(?4, actual_model_source)
+             WHERE id = ?1
+            "#,
+            vec![
+                crate::db::uuid_val(charge_id),
+                crate::db::opt_val(route.requested_model.as_deref()),
+                crate::db::opt_val(route.actual_model.as_deref()),
+                crate::db::opt_val(route.actual_model_source.as_deref()),
+            ],
+        )
+        .await?;
     Ok(())
 }
 

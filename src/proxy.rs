@@ -3729,7 +3729,7 @@ async fn lookup_sticky_route_pair_by_keys(
                  WHERE sticky_key=?1 AND expires_at>?2
                  LIMIT 1
                 "#,
-                vec![crate::db::val(sticky_key), crate::db::val(now)],
+                vec![crate::db::val(*sticky_key), crate::db::val(now)],
             )
             .await?
         {

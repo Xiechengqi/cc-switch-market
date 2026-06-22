@@ -1257,6 +1257,7 @@ async fn settle_reserved_request(
         .await?;
     }
     tx.commit().await?;
+    trigger_router_request_log_sync(state.clone());
     Ok(())
 }
 
@@ -1306,6 +1307,7 @@ pub async fn admin_settle_needs_review_charge(
     )
     .await?;
     tx.commit().await?;
+    trigger_router_request_log_sync(state.clone());
     Ok(())
 }
 
@@ -1361,6 +1363,7 @@ pub async fn admin_release_needs_review_charge(
     )
     .await?;
     tx.commit().await?;
+    trigger_router_request_log_sync(state.clone());
     Ok(())
 }
 
@@ -1419,6 +1422,7 @@ async fn mark_stream_needs_review(
         .await?;
     }
     tx.commit().await?;
+    trigger_router_request_log_sync(state.clone());
     Ok(())
 }
 

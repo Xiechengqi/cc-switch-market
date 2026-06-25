@@ -3678,7 +3678,7 @@ fn api_key_allows_model_access(
             .iter()
             .filter_map(|value| value.as_str())
             .map(normalize_model_vendor)
-            .any(|allowed| allowed == vendor);
+            .any(|allowed| allowed == "*" || allowed == vendor);
     }
     if let Some(model_access) = scope
         .get("model_access")
@@ -3721,9 +3721,9 @@ fn normalize_model_vendor(value: &str) -> String {
 
 fn default_agent_model_vendors(capability: &str) -> Vec<String> {
     match capability {
-        "claude" => vec!["anthropic".to_string(), "cursor".to_string()],
-        "codex" => vec!["openai".to_string(), "cursor".to_string()],
-        "gemini" => vec!["gemini".to_string()],
+        "claude" => vec!["*".to_string()],
+        "codex" => vec!["*".to_string()],
+        "gemini" => vec!["*".to_string()],
         _ => Vec::new(),
     }
 }
@@ -5270,7 +5270,7 @@ mod tests {
             "anthropic",
             Some(Uuid::nil()),
         ));
-        assert!(!api_key_allows_model_access(
+        assert!(api_key_allows_model_access(
             &api,
             "claude",
             "sonnet",
@@ -5319,6 +5319,65 @@ mod tests {
             "model",
             "claude-sonnet-4-6",
             "anthropic",
+            Some(Uuid::nil()),
+        ));
+    }
+
+    #[test]
+    fn api_key_vendor_scope_wildcard_allows_all_vendors() {
+        let api = ApiKeyPrincipal {
+            user_id: Uuid::nil(),
+            user_email: "user@example.com".into(),
+            api_key_id: Uuid::nil(),
+            is_admin: false,
+            monthly_spend_cap: None,
+            scope_json: Some(json!({
+                "agent_model_vendors": {
+                    "claude": ["*"],
+                    "codex": ["*"],
+                    "gemini": ["*"]
+                }
+            })),
+        };
+
+        // Wildcard allows standard vendors.
+        assert!(api_key_allows_model_access(
+            &api,
+            "codex",
+            "model",
+            "gpt-5.5",
+            "openai",
+            Some(Uuid::nil()),
+        ));
+        // Wildcard allows non-standard vendors like glm.
+        assert!(api_key_allows_model_access(
+            &api,
+            "codex",
+            "model",
+            "glm-5.2",
+            "glm",
+            Some(Uuid::nil()),
+        ));
+    }
+
+    #[test]
+    fn api_key_vendor_scope_defaults_allow_all_vendors() {
+        let api = ApiKeyPrincipal {
+            user_id: Uuid::nil(),
+            user_email: "user@example.com".into(),
+            api_key_id: Uuid::nil(),
+            is_admin: false,
+            monthly_spend_cap: None,
+            scope_json: None,
+        };
+
+        // Default (no scope) now allows all vendors including non-standard ones.
+        assert!(api_key_allows_model_access(
+            &api,
+            "codex",
+            "model",
+            "glm-5.2",
+            "glm",
             Some(Uuid::nil()),
         ));
     }

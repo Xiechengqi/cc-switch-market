@@ -166,7 +166,10 @@ const BASE_AGENT_MODEL_VENDOR_OPTIONS = [
     ],
   },
 ] as const;
-const DEFAULT_AGENT_VENDOR_KEYS = ["claude:anthropic", "claude:cursor", "codex:openai", "codex:cursor", "gemini:gemini"];
+const DEFAULT_AGENT_VENDOR_KEYS = ["claude:*", "codex:*", "gemini:*"];
+const ALL_VENDOR_WILDCARD = "*";
+const allVendorKey = (agent: string) => `${agent}:${ALL_VENDOR_WILDCARD}`;
+const isAllVendorKey = (key: string) => key.endsWith(`:${ALL_VENDOR_WILDCARD}`);
 const SCHEDULING_PROFILE_OPTIONS = [
   "balanced",
   "price-first",
@@ -840,6 +843,39 @@ function ApiKeyLimitFields({ value, onChange, prices }: { value: ApiKeyLimitForm
     });
   }
 
+  function toggleAllVendors(agent: string) {
+    const wildcard = allVendorKey(agent);
+    if (value.selectedVendorKeys.includes(wildcard)) {
+      patch({
+        selectedVendorKeys: value.selectedVendorKeys.filter((item) => item !== wildcard),
+      });
+    } else {
+      // Remove all concrete vendor keys for this agent, replace with wildcard.
+      patch({
+        selectedVendorKeys: [
+          ...value.selectedVendorKeys.filter((item) => !item.startsWith(`${agent}:`) || isAllVendorKey(item)),
+          wildcard,
+        ],
+      });
+    }
+  }
+
+  function toggleVendorKeyFromWildcard(agent: string, vendorId: string) {
+    // When wildcard is active and user clicks a specific vendor, switch from
+    // wildcard to explicit selection: start with all vendors checked, then
+    // uncheck the clicked one.
+    const agentOption = vendorOptions.find((opt) => opt.agent === agent);
+    if (!agentOption) return;
+    const allConcreteKeys = agentOption.vendors.map((v) => `${agent}:${v.id}`);
+    const key = `${agent}:${vendorId}`;
+    patch({
+      selectedVendorKeys: [
+        ...value.selectedVendorKeys.filter((item) => !item.startsWith(`${agent}:`)),
+        ...allConcreteKeys.filter((k) => k !== key),
+      ],
+    });
+  }
+
   return (
     <div className="mt-4 grid gap-4">
       <div className="rounded-3xl border-2 border-slate-800 bg-white p-4">
@@ -897,13 +933,36 @@ function ApiKeyLimitFields({ value, onChange, prices }: { value: ApiKeyLimitForm
           {prices && vendorOptions.map((agent) => (
             <div key={agent.agent} className="rounded-xl border-2 border-slate-200 bg-white p-3">
               <div className="mb-2 text-sm font-black">{agent.label}</div>
+              <div className="mb-2">
+                <label className="inline-flex cursor-pointer items-center gap-2 rounded-full border-2 border-slate-800 bg-amber-100 px-3 py-1.5 text-xs font-black">
+                  <input
+                    type="checkbox"
+                    checked={value.selectedVendorKeys.includes(allVendorKey(agent.agent))}
+                    onChange={() => toggleAllVendors(agent.agent)}
+                  />
+                  <span>{c.selectAll}</span>
+                </label>
+              </div>
               <div className="flex flex-wrap gap-2">
                 {agent.vendors.map((vendor) => {
                   const key = `${agent.agent}:${vendor.id}`;
-                  const checked = value.selectedVendorKeys.includes(key);
+                  const wildcardActive = value.selectedVendorKeys.includes(allVendorKey(agent.agent));
+                  const checked = wildcardActive || value.selectedVendorKeys.includes(key);
                   return (
-                    <label key={key} className="inline-flex cursor-pointer items-center gap-2 rounded-full border-2 border-slate-800 bg-amber-50 px-3 py-1.5 text-xs font-bold">
-                      <input type="checkbox" checked={checked} onChange={() => toggleVendorKey(key)} />
+                    <label
+                      key={key}
+                      className={`inline-flex cursor-pointer items-center gap-2 rounded-full border-2 border-slate-800 px-3 py-1.5 text-xs font-bold ${checked ? "bg-amber-100" : "bg-amber-50"} ${wildcardActive ? "opacity-60" : ""}`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        disabled={wildcardActive}
+                        onChange={() =>
+                          wildcardActive
+                            ? toggleVendorKeyFromWildcard(agent.agent, vendor.id)
+                            : toggleVendorKey(key)
+                        }
+                      />
                       <span>{vendor.label}</span>
                     </label>
                   );

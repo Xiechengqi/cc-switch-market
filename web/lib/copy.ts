@@ -356,7 +356,8 @@ export const copy = {
         spendCapLabel: "最大费用",
         spendCapHint: "按自然月统计，单位 USD",
         modelScopeLabel: "Agent 模型厂商权限",
-        modelScopeHint: "按 Claude / Codex / Gemini 分别授权可使用的模型厂商。默认 Claude=Anthropic、Codex=OpenAI、Gemini=Gemini",
+        modelScopeHint: "按 Claude / Codex / Gemini 分别授权可使用的模型厂商。默认全选所有厂商，包括后续新增的厂商",
+        selectAll: "全选",
         schedulingLabel: "调度策略",
         schedulingHint: "决定该密钥的请求如何在可用 Share 间排序。默认均衡。",
         schedulingProfiles: {
@@ -1309,7 +1310,8 @@ export const copy = {
         spendCapLabel: "Max spend",
         spendCapHint: "Calendar-month cap in USD.",
         modelScopeLabel: "Agent model vendors",
-        modelScopeHint: "Authorize model vendors separately for Claude, Codex and Gemini. Defaults: Claude=Anthropic, Codex=OpenAI, Gemini=Gemini.",
+        modelScopeHint: "Authorize model vendors separately for Claude, Codex and Gemini. All vendors are selected by default, including vendors added later.",
+        selectAll: "Select all",
         schedulingLabel: "Scheduling profile",
         schedulingHint: "Controls how this key's requests rank across available shares. Balanced by default.",
         schedulingProfiles: {

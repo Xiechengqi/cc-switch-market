@@ -117,6 +117,34 @@ impl ObjectStore {
         }
     }
 
+    pub async fn remove_empty_parent_dirs(&self, object_key: &str) -> anyhow::Result<()> {
+        let path = self.path_for_key(object_key)?;
+        let Some(parent) = path.parent() else {
+            return Ok(());
+        };
+        let mut current = parent.to_path_buf();
+        while current != self.root {
+            match tokio::fs::remove_dir(&current).await {
+                Ok(()) => {}
+                Err(err) => {
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                    ) {
+                        break;
+                    }
+                    return Err(err)
+                        .with_context(|| format!("remove empty object dir {}", current.display()));
+                }
+            }
+            let Some(parent) = current.parent() else {
+                break;
+            };
+            current = parent.to_path_buf();
+        }
+        Ok(())
+    }
+
     pub async fn health_check(&self) -> bool {
         let key = format!("health/{}.txt", Uuid::new_v4());
         self.put_bytes(&key, Utc::now().to_rfc3339().as_bytes())

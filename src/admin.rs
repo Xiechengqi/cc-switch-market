@@ -726,9 +726,15 @@ pub async fn charge_review_context(
             ],
         )
         .await?;
-    let request_json = read_json_object(&state, charge.opt_string("request_object_key")).await;
-    let response_meta_json =
-        read_json_object(&state, charge.opt_string("response_meta_object_key")).await;
+    let request_object_key = charge.opt_string("request_object_key");
+    let request_object_sha256 = charge.opt_string("request_object_sha256");
+    let response_meta_object_key = charge.opt_string("response_meta_object_key");
+    let response_meta_object_sha256 = charge.opt_string("response_meta_object_sha256");
+    let request_json = read_json_object(&state, request_object_key.clone()).await;
+    let response_meta_json = read_json_object(&state, response_meta_object_key.clone()).await;
+    let request_object_expired = request_object_key.is_none() && request_object_sha256.is_some();
+    let response_meta_object_expired =
+        response_meta_object_key.is_none() && response_meta_object_sha256.is_some();
     let share_raw_json = router_share
         .as_ref()
         .and_then(|row| row.opt_string("raw_json"))
@@ -755,13 +761,15 @@ pub async fn charge_review_context(
         "objects": objects.into_iter().map(|row| row.to_json()).collect::<Vec<_>>(),
         "routerShare": router_share.map(|row| row.to_json()),
         "requestObject": {
-            "objectKey": charge.opt_string("request_object_key"),
-            "sha256": charge.opt_string("request_object_sha256"),
+            "objectKey": request_object_key,
+            "sha256": request_object_sha256,
+            "expired": request_object_expired,
             "json": sanitized_request_json,
         },
         "responseMetaObject": {
-            "objectKey": charge.opt_string("response_meta_object_key"),
-            "sha256": charge.opt_string("response_meta_object_sha256"),
+            "objectKey": response_meta_object_key,
+            "sha256": response_meta_object_sha256,
+            "expired": response_meta_object_expired,
             "json": response_meta_json.map(sanitize_json),
         },
         "curl": {
@@ -2115,6 +2123,34 @@ fn env_fields() -> Vec<EnvField> {
             default_value: "$HOME/.config/cc-switch-market/objects",
             placeholder: "$HOME/.config/cc-switch-market/objects",
             unit: "",
+        },
+        EnvField {
+            key: "REQUEST_OBJECT_RETENTION_DAYS",
+            category: "storage",
+            label_zh: "请求调试对象保留天数",
+            label_en: "Request object retention",
+            description_zh: "保留 API 请求调试对象的天数。超期后仅清理已终态且没有未关闭工单的 request body / response meta。",
+            description_en: "How many days to keep API request debug objects. Expired cleanup only removes terminal charges without open tickets.",
+            kind: "number",
+            secret: false,
+            required: true,
+            default_value: "7",
+            placeholder: "7",
+            unit: "days",
+        },
+        EnvField {
+            key: "REQUEST_OBJECT_CLEANUP_BATCH_SIZE",
+            category: "storage",
+            label_zh: "请求对象清理批量",
+            label_en: "Request cleanup batch size",
+            description_zh: "每轮维护任务最多清理的请求调试对象记录数，用于限制单次清理压力。",
+            description_en: "Maximum request debug object records cleaned per maintenance run.",
+            kind: "number",
+            secret: false,
+            required: true,
+            default_value: "1000",
+            placeholder: "1000",
+            unit: "rows",
         },
         EnvField {
             key: "R2_ACCOUNT_ID",

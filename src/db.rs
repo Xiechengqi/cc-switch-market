@@ -275,7 +275,9 @@ async fn additive_migrations(db: &Db) -> anyhow::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_request_charges_user_created ON request_charges(user_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_tickets_updated_at ON tickets(updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_tickets_status_updated ON tickets(status, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_tickets_related_status ON tickets(related_reference_type, related_reference_id, status);
         CREATE INDEX IF NOT EXISTS idx_ticket_messages_ticket_created ON ticket_messages(ticket_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_object_refs_request_role_created ON object_refs(reference_type, object_role, created_at);
         CREATE INDEX IF NOT EXISTS idx_admin_audit_created_at ON admin_audit(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_payout_requests_status_created ON payout_requests(status, created_at DESC);
         CREATE TABLE IF NOT EXISTS app_settings (
@@ -1767,6 +1769,7 @@ CREATE TABLE IF NOT EXISTS tickets (
 );
 CREATE INDEX IF NOT EXISTS idx_tickets_updated_at ON tickets(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tickets_status_updated ON tickets(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tickets_related_status ON tickets(related_reference_type, related_reference_id, status);
 
 CREATE TABLE IF NOT EXISTS ticket_messages (
   id TEXT PRIMARY KEY,
@@ -1808,6 +1811,7 @@ CREATE TABLE IF NOT EXISTS object_refs (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_object_refs_reference ON object_refs(reference_type, reference_id);
+CREATE INDEX IF NOT EXISTS idx_object_refs_request_role_created ON object_refs(reference_type, object_role, created_at);
 
 CREATE TABLE IF NOT EXISTS admin_audit (
   id TEXT PRIMARY KEY,

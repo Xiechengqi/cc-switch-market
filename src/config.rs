@@ -35,6 +35,8 @@ pub struct Config {
     pub turso_backup_retention_days: i64,
     pub object_store_backend: String,
     pub object_store_local_dir: PathBuf,
+    pub request_object_retention_days: i64,
+    pub request_object_cleanup_batch_size: i64,
     pub r2_account_id: String,
     pub r2_access_key_id: String,
     pub r2_secret_access_key: String,
@@ -147,6 +149,12 @@ impl Config {
                 .unwrap_or(7),
             object_store_backend: env("OBJECT_STORE_BACKEND", "local"),
             object_store_local_dir: env_path("OBJECT_STORE_LOCAL_DIR", "objects"),
+            request_object_retention_days: env("REQUEST_OBJECT_RETENTION_DAYS", "7")
+                .parse()
+                .unwrap_or(7),
+            request_object_cleanup_batch_size: env("REQUEST_OBJECT_CLEANUP_BATCH_SIZE", "1000")
+                .parse()
+                .unwrap_or(1000),
             r2_account_id: env("R2_ACCOUNT_ID", ""),
             r2_access_key_id: env("R2_ACCESS_KEY_ID", ""),
             r2_secret_access_key: env("R2_SECRET_ACCESS_KEY", ""),
@@ -263,6 +271,12 @@ impl Config {
         }
         if self.object_store_backend == "r2" {
             bail!("OBJECT_STORE_BACKEND=r2 is reserved; current binary supports local only");
+        }
+        if self.request_object_retention_days < 1 {
+            bail!("REQUEST_OBJECT_RETENTION_DAYS must be at least 1");
+        }
+        if self.request_object_cleanup_batch_size < 1 {
+            bail!("REQUEST_OBJECT_CLEANUP_BATCH_SIZE must be at least 1");
         }
         if !self.dodo_api_key.trim().is_empty() && self.dodo_product_id.trim().is_empty() {
             bail!("DODO_PRODUCT_ID is required when DODO_API_KEY is configured");
@@ -384,6 +398,14 @@ impl Config {
             (
                 "OBJECT_STORE_LOCAL_DIR".into(),
                 self.object_store_local_dir.display().to_string(),
+            ),
+            (
+                "REQUEST_OBJECT_RETENTION_DAYS".into(),
+                self.request_object_retention_days.to_string(),
+            ),
+            (
+                "REQUEST_OBJECT_CLEANUP_BATCH_SIZE".into(),
+                self.request_object_cleanup_batch_size.to_string(),
             ),
             ("R2_ACCOUNT_ID".into(), self.r2_account_id.clone()),
             ("R2_ACCESS_KEY_ID".into(), self.r2_access_key_id.clone()),

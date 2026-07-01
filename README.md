@@ -187,6 +187,8 @@ $HOME/.config/cc-switch-market/.env
 | `TURSO_BACKUP_RETENTION_DAYS` | `7` | Turso 本地备份保留天数，默认只保留最近 1 周。 |
 | `OBJECT_STORE_BACKEND` | `local` | 对象存储后端。当前 binary 支持 `local`；`r2` 为生产扩展预留，配置后会 fail-fast。 |
 | `OBJECT_STORE_LOCAL_DIR` | `$HOME/.config/cc-switch-market/objects` | 本地对象存储目录。 |
+| `REQUEST_OBJECT_RETENTION_DAYS` | `7` | API 请求调试对象保留天数。仅自动清理已终态且没有未关闭工单的 request body / response meta 对象，sha256 和账务记录会保留。 |
+| `REQUEST_OBJECT_CLEANUP_BATCH_SIZE` | `1000` | 每轮维护任务最多清理的请求调试对象记录数，用于限制单次清理压力。 |
 | `R2_ACCOUNT_ID` | 空 | Cloudflare R2 account id，当前预留未启用。 |
 | `R2_ACCESS_KEY_ID` | 空 | Cloudflare R2 access key id，当前预留未启用。 |
 | `R2_SECRET_ACCESS_KEY` | 空 | Cloudflare R2 secret access key，当前预留未启用。 |

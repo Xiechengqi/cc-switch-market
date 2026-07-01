@@ -161,6 +161,20 @@ const FIELDS: &[Field] = &[
         required: false,
     },
     Field {
+        key: "REQUEST_OBJECT_RETENTION_DAYS",
+        prompt: "Request debug object retention days",
+        default: "7",
+        kind: FieldKind::Text,
+        required: false,
+    },
+    Field {
+        key: "REQUEST_OBJECT_CLEANUP_BATCH_SIZE",
+        prompt: "Request debug object cleanup batch size",
+        default: "1000",
+        kind: FieldKind::Text,
+        required: false,
+    },
+    Field {
         key: "R2_ACCOUNT_ID",
         prompt: "Cloudflare R2 account id, reserved",
         default: "",
@@ -550,6 +564,8 @@ fn validate_database_config(values: &BTreeMap<String, String>) -> anyhow::Result
         "TURSO_SYNC_INTERVAL_SECS",
         "TURSO_BACKUP_INTERVAL_SECS",
         "TURSO_BACKUP_RETENTION_DAYS",
+        "REQUEST_OBJECT_RETENTION_DAYS",
+        "REQUEST_OBJECT_CLEANUP_BATCH_SIZE",
     ] {
         let value = values
             .get(key)
